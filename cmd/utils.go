@@ -32,17 +32,19 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"runtime/pprof"
+	"runtime/trace"
 	"strings"
+	"sync"
 	"time"
 
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/handlers"
-	iampolicy "github.com/minio/minio/pkg/iam/policy"
 
 	humanize "github.com/dustin/go-humanize"
 	"github.com/gorilla/mux"
-	"github.com/pkg/profile"
 )
 
 // IsErrIgnored returns whether given error is ignored or not.
@@ -145,9 +147,10 @@ const (
 	// (Acceptable values range from 1 to 10000 inclusive)
 	globalMaxPartID = 10000
 
-	// Default values used while communicating with the cloud backends
-	defaultDialTimeout   = 30 * time.Second
-	defaultDialKeepAlive = 30 * time.Second
+	// Default values used while communicating for
+	// internode communication.
+	defaultDialTimeout   = 15 * time.Second
+	defaultDialKeepAlive = 20 * time.Second
 )
 
 // isMaxObjectSize - verify if max object size
@@ -186,94 +189,130 @@ func contains(slice interface{}, elem interface{}) bool {
 // provide any API to calculate the profiler file path in the
 // disk since the name of this latter is randomly generated.
 type profilerWrapper struct {
-	stopFn func()
-	pathFn func() string
+	stopFn func() ([]byte, error)
 }
 
-func (p profilerWrapper) Stop() {
-	p.stopFn()
-}
-
-func (p profilerWrapper) Path() string {
-	return p.pathFn()
+func (p profilerWrapper) Stop() ([]byte, error) {
+	return p.stopFn()
 }
 
 // Returns current profile data, returns error if there is no active
 // profiling in progress. Stops an active profile.
-func getProfileData() ([]byte, error) {
-	if globalProfiler == nil {
+func getProfileData() (map[string][]byte, error) {
+	globalProfilerMu.Lock()
+	defer globalProfilerMu.Unlock()
+
+	if len(globalProfiler) == 0 {
 		return nil, errors.New("profiler not enabled")
 	}
 
-	profilerPath := globalProfiler.Path()
-
-	// Stop the profiler
-	globalProfiler.Stop()
-
-	profilerFile, err := os.Open(profilerPath)
-	if err != nil {
-		return nil, err
+	dst := make(map[string][]byte, len(globalProfiler))
+	for typ, prof := range globalProfiler {
+		// Stop the profiler
+		var err error
+		buf, err := prof.Stop()
+		delete(globalProfiler, typ)
+		if err == nil {
+			dst[typ] = buf
+		}
 	}
-
-	return ioutil.ReadAll(profilerFile)
+	return dst, nil
 }
 
 // Starts a profiler returns nil if profiler is not enabled, caller needs to handle this.
-func startProfiler(profilerType, dirPath string) (minioProfiler, error) {
-	var err error
-	if dirPath == "" {
-		dirPath, err = ioutil.TempDir("", "profile")
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	var profiler interface {
-		Stop()
-	}
-
-	var profilerFileName string
+func startProfiler(profilerType string) (minioProfiler, error) {
+	var prof profilerWrapper
 
 	// Enable profiler and set the name of the file that pkg/pprof
 	// library creates to store profiling data.
 	switch profilerType {
 	case "cpu":
-		profiler = profile.Start(profile.CPUProfile, profile.NoShutdownHook, profile.ProfilePath(dirPath))
-		profilerFileName = "cpu.pprof"
+		dirPath, err := ioutil.TempDir("", "profile")
+		if err != nil {
+			return nil, err
+		}
+		fn := filepath.Join(dirPath, "cpu.out")
+		f, err := os.Create(fn)
+		if err != nil {
+			return nil, err
+		}
+		err = pprof.StartCPUProfile(f)
+		if err != nil {
+			return nil, err
+		}
+		prof.stopFn = func() ([]byte, error) {
+			pprof.StopCPUProfile()
+			err := f.Close()
+			if err != nil {
+				return nil, err
+			}
+			defer os.RemoveAll(dirPath)
+			return ioutil.ReadFile(fn)
+		}
 	case "mem":
-		profiler = profile.Start(profile.MemProfile, profile.NoShutdownHook, profile.ProfilePath(dirPath))
-		profilerFileName = "mem.pprof"
+		old := runtime.MemProfileRate
+		runtime.MemProfileRate = 4096
+		prof.stopFn = func() ([]byte, error) {
+			var buf bytes.Buffer
+			runtime.MemProfileRate = old
+			err := pprof.Lookup("heap").WriteTo(&buf, 0)
+			return buf.Bytes(), err
+		}
 	case "block":
-		profiler = profile.Start(profile.BlockProfile, profile.NoShutdownHook, profile.ProfilePath(dirPath))
-		profilerFileName = "block.pprof"
+		runtime.SetBlockProfileRate(1)
+		prof.stopFn = func() ([]byte, error) {
+			var buf bytes.Buffer
+			runtime.SetBlockProfileRate(0)
+			err := pprof.Lookup("block").WriteTo(&buf, 0)
+			return buf.Bytes(), err
+		}
 	case "mutex":
-		profiler = profile.Start(profile.MutexProfile, profile.NoShutdownHook, profile.ProfilePath(dirPath))
-		profilerFileName = "mutex.pprof"
+		runtime.SetMutexProfileFraction(1)
+		prof.stopFn = func() ([]byte, error) {
+			var buf bytes.Buffer
+			runtime.SetMutexProfileFraction(0)
+			err := pprof.Lookup("mutex").WriteTo(&buf, 0)
+			return buf.Bytes(), err
+		}
 	case "trace":
-		profiler = profile.Start(profile.TraceProfile, profile.NoShutdownHook, profile.ProfilePath(dirPath))
-		profilerFileName = "trace.out"
+		dirPath, err := ioutil.TempDir("", "profile")
+		if err != nil {
+			return nil, err
+		}
+		fn := filepath.Join(dirPath, "trace.out")
+		f, err := os.Create(fn)
+		if err != nil {
+			return nil, err
+		}
+		err = trace.Start(f)
+		if err != nil {
+			return nil, err
+		}
+		prof.stopFn = func() ([]byte, error) {
+			trace.Stop()
+			err := f.Close()
+			if err != nil {
+				return nil, err
+			}
+			defer os.RemoveAll(dirPath)
+			return ioutil.ReadFile(fn)
+		}
 	default:
 		return nil, errors.New("profiler type unknown")
 	}
 
-	return &profilerWrapper{
-		stopFn: profiler.Stop,
-		pathFn: func() string {
-			return filepath.Join(dirPath, profilerFileName)
-		},
-	}, nil
+	return prof, nil
 }
 
 // minioProfiler - minio profiler interface.
 type minioProfiler interface {
 	// Stop the profiler
-	Stop()
-	// Return the path of the profiling file
-	Path() string
+	Stop() ([]byte, error)
 }
 
 // Global profiler to be used by service go-routine.
-var globalProfiler minioProfiler
+var globalProfiler map[string]minioProfiler
+var globalProfilerMu sync.Mutex
 
 // dump the request into a string in JSON format.
 func dumpRequest(r *http.Request) string {
@@ -332,25 +371,50 @@ func ToS3ETag(etag string) string {
 	return etag
 }
 
+type dialContext func(ctx context.Context, network, address string) (net.Conn, error)
+
+func newCustomDialContext(dialTimeout, dialKeepAlive time.Duration) dialContext {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialer := &net.Dialer{
+			Timeout:   dialTimeout,
+			KeepAlive: dialKeepAlive,
+		}
+
+		return dialer.DialContext(ctx, network, addr)
+	}
+}
+
+func newCustomHTTPTransport(tlsConfig *tls.Config, dialTimeout, dialKeepAlive time.Duration) func() *http.Transport {
+	// For more details about various values used here refer
+	// https://golang.org/pkg/net/http/#Transport documentation
+	tr := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           newCustomDialContext(dialTimeout, dialKeepAlive),
+		MaxIdleConns:          256,
+		MaxIdleConnsPerHost:   256,
+		IdleConnTimeout:       30 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+		ExpectContinueTimeout: 3 * time.Second,
+		TLSClientConfig:       tlsConfig,
+		// Go net/http automatically unzip if content-type is
+		// gzip disable this feature, as we are always interested
+		// in raw stream.
+		DisableCompression: true,
+	}
+	return func() *http.Transport {
+		return tr
+	}
+}
+
 // NewCustomHTTPTransport returns a new http configuration
 // used while communicating with the cloud backends.
 // This sets the value for MaxIdleConnsPerHost from 2 (go default)
-// to 100.
+// to 256.
 func NewCustomHTTPTransport() *http.Transport {
-	return &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   defaultDialTimeout,
-			KeepAlive: defaultDialKeepAlive,
-		}).DialContext,
-		MaxIdleConns:          1024,
-		MaxIdleConnsPerHost:   1024,
-		IdleConnTimeout:       30 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		TLSClientConfig:       &tls.Config{RootCAs: globalRootCAs},
-		DisableCompression:    true,
-	}
+	return newCustomHTTPTransport(&tls.Config{
+		RootCAs: globalRootCAs,
+	}, defaultDialTimeout, defaultDialKeepAlive)()
 }
 
 // Load the json (typically from disk file).
@@ -489,6 +553,23 @@ func getMinioMode() string {
 	return mode
 }
 
-func iamPolicyName() string {
-	return globalOpenIDConfig.ClaimPrefix + iampolicy.PolicyName
+func splitN(str, delim string, num int) []string {
+	stdSplit := strings.SplitN(str, delim, num)
+	retSplit := make([]string, num)
+	for i := 0; i < len(stdSplit); i++ {
+		retSplit[i] = stdSplit[i]
+	}
+
+	return retSplit
+}
+
+func iamPolicyClaimName() string {
+	return globalOpenIDConfig.ClaimPrefix + globalOpenIDConfig.ClaimName
+}
+
+func isWORMEnabled(bucket string) bool {
+	if isMinioMetaBucketName(bucket) {
+		return false
+	}
+	return globalWORMEnabled
 }

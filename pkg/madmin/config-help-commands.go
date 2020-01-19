@@ -19,42 +19,33 @@ package madmin
 
 import (
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/url"
-	"strings"
-	"text/tabwriter"
-	"text/template"
-
-	"github.com/minio/minio/pkg/color"
 )
 
-// Help template used by all sub-systems
-const Help = `{{colorBlueBold "Key"}}{{"\t"}}{{colorBlueBold "Description"}}
-{{colorYellowBold "----"}}{{"\t"}}{{colorYellowBold "----"}}
-{{range $key, $value := .}}{{colorCyanBold $key}}{{ "\t" }}{{$value}}
-{{end}}`
-
-// HelpEnv template used by all sub-systems
-const HelpEnv = `{{colorBlueBold "KeyEnv"}}{{"\t"}}{{colorBlueBold "Description"}}
-{{colorYellowBold "----"}}{{"\t"}}{{colorYellowBold "----"}}
-{{range $key, $value := .}}{{colorCyanBold $key}}{{ "\t" }}{{$value}}
-{{end}}`
-
-var funcMap = template.FuncMap{
-	"colorBlueBold":   color.BlueBold,
-	"colorYellowBold": color.YellowBold,
-	"colorCyanBold":   color.CyanBold,
+// Help - return sub-system level help
+type Help struct {
+	SubSys          string  `json:"subSys"`
+	Description     string  `json:"description"`
+	MultipleTargets bool    `json:"multipleTargets"`
+	KeysHelp        HelpKVS `json:"keysHelp"`
 }
 
-// HelpTemplate - captures config help template
-var HelpTemplate = template.Must(template.New("config-help").Funcs(funcMap).Parse(Help))
+// HelpKV - implements help messages for keys
+// with value as description of the keys.
+type HelpKV struct {
+	Key             string `json:"key"`
+	Description     string `json:"description"`
+	Optional        bool   `json:"optional"`
+	Type            string `json:"type"`
+	MultipleTargets bool   `json:"multipleTargets"`
+}
 
-// HelpEnvTemplate - captures config help template
-var HelpEnvTemplate = template.Must(template.New("config-help-env").Funcs(funcMap).Parse(HelpEnv))
+// HelpKVS - implement order of keys help messages.
+type HelpKVS []HelpKV
 
 // HelpConfigKV - return help for a given sub-system.
-func (adm *AdminClient) HelpConfigKV(subSys, key string, envOnly bool) (io.Reader, error) {
+func (adm *AdminClient) HelpConfigKV(subSys, key string, envOnly bool) (Help, error) {
 	v := url.Values{}
 	v.Set("subSys", subSys)
 	v.Set("key", key)
@@ -70,31 +61,20 @@ func (adm *AdminClient) HelpConfigKV(subSys, key string, envOnly bool) (io.Reade
 	// Execute GET on /minio/admin/v2/help-config-kv
 	resp, err := adm.executeMethod(http.MethodGet, reqData)
 	if err != nil {
-		return nil, err
+		return Help{}, err
 	}
 	defer closeResponse(resp)
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, httpRespToErrorResponse(resp)
+		return Help{}, httpRespToErrorResponse(resp)
 	}
 
-	var help = make(map[string]string)
+	var help = Help{}
 	d := json.NewDecoder(resp.Body)
+	d.DisallowUnknownFields()
 	if err = d.Decode(&help); err != nil {
-		return nil, err
+		return help, err
 	}
 
-	var s strings.Builder
-	w := tabwriter.NewWriter(&s, 1, 8, 2, ' ', 0)
-	if !envOnly {
-		err = HelpTemplate.Execute(w, help)
-	} else {
-		err = HelpEnvTemplate.Execute(w, help)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	w.Flush()
-	return strings.NewReader(s.String()), nil
+	return help, nil
 }

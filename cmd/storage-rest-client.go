@@ -19,6 +19,7 @@ package cmd
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/gob"
 	"encoding/hex"
@@ -27,9 +28,11 @@ import (
 	"net/url"
 	"path"
 	"strconv"
+	"strings"
 	"sync/atomic"
 
 	"github.com/minio/minio/cmd/http"
+	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/cmd/rest"
 	xnet "github.com/minio/minio/pkg/net"
 )
@@ -44,9 +47,9 @@ func isNetworkError(err error) bool {
 	return false
 }
 
-// Converts rpc.ServerError to underlying error. This function is
-// written so that the storageAPI errors are consistent across network
-// disks as well.
+// Converts network error to storageErr. This function is
+// written so that the storageAPI errors are consistent
+// across network disks.
 func toStorageErr(err error) error {
 	if err == nil {
 		return nil
@@ -108,14 +111,13 @@ type storageRESTClient struct {
 	endpoint   Endpoint
 	restClient *rest.Client
 	connected  int32
-	lastError  error
 	diskID     string
 }
 
 // Wrapper to restClient.Call to handle network errors, in case of network error the connection is makred disconnected
 // permanently. The only way to restore the storage connection is at the xl-sets layer by xlsets.monitorAndConnectEndpoints()
 // after verifying format.json
-func (client *storageRESTClient) call(method string, values url.Values, body io.Reader, length int64) (respBody io.ReadCloser, err error) {
+func (client *storageRESTClient) call(method string, values url.Values, body io.Reader, length int64) (io.ReadCloser, error) {
 	if !client.IsOnline() {
 		return nil, errDiskNotFound
 	}
@@ -123,16 +125,17 @@ func (client *storageRESTClient) call(method string, values url.Values, body io.
 		values = make(url.Values)
 	}
 	values.Set(storageRESTDiskID, client.diskID)
-	respBody, err = client.restClient.Call(method, values, body, length)
+	respBody, err := client.restClient.Call(method, values, body, length)
 	if err == nil {
 		return respBody, nil
 	}
-	client.lastError = err
-	if isNetworkError(err) || err.Error() == errDiskStale.Error() {
+
+	err = toStorageErr(err)
+	if err == errDiskNotFound {
 		atomic.StoreInt32(&client.connected, 0)
 	}
 
-	return nil, toStorageErr(err)
+	return nil, err
 }
 
 // Stringer provides a canonicalized representation of network device.
@@ -145,9 +148,30 @@ func (client *storageRESTClient) IsOnline() bool {
 	return atomic.LoadInt32(&client.connected) == 1
 }
 
-// LastError - returns the network error if any.
-func (client *storageRESTClient) LastError() error {
-	return client.lastError
+func (client *storageRESTClient) Hostname() string {
+	return client.endpoint.Host
+}
+
+func (client *storageRESTClient) CrawlAndGetDataUsage(endCh <-chan struct{}) (DataUsageInfo, error) {
+	respBody, err := client.call(storageRESTMethodCrawlAndGetDataUsage, nil, nil, -1)
+	defer http.DrainBody(respBody)
+	if err != nil {
+		return DataUsageInfo{}, err
+	}
+	reader := bufio.NewReader(respBody)
+	for {
+		b, err := reader.ReadByte()
+		if err != nil {
+			return DataUsageInfo{}, err
+		}
+		if b != ' ' {
+			reader.UnreadByte()
+			break
+		}
+	}
+	var usageInfo DataUsageInfo
+	err = gob.NewDecoder(reader).Decode(&usageInfo)
+	return usageInfo, err
 }
 
 func (client *storageRESTClient) SetDiskID(id string) {
@@ -163,6 +187,15 @@ func (client *storageRESTClient) DiskInfo() (info DiskInfo, err error) {
 	defer http.DrainBody(respBody)
 	err = gob.NewDecoder(respBody).Decode(&info)
 	return info, err
+}
+
+// MakeVolBulk - create multiple volumes in a bulk operation.
+func (client *storageRESTClient) MakeVolBulk(volumes ...string) (err error) {
+	values := make(url.Values)
+	values.Set(storageRESTVolumes, strings.Join(volumes, ","))
+	respBody, err := client.call(storageRESTMethodMakeVolBulk, values, nil, -1)
+	defer http.DrainBody(respBody)
+	return err
 }
 
 // MakeVol - create a volume on a remote disk.
@@ -446,36 +479,27 @@ func (client *storageRESTClient) Close() error {
 }
 
 // Returns a storage rest client.
-func newStorageRESTClient(endpoint Endpoint) (*storageRESTClient, error) {
-	host, err := xnet.ParseHost(endpoint.Host)
-	if err != nil {
-		return nil, err
-	}
-
-	scheme := "http"
-	if globalIsSSL {
-		scheme = "https"
-	}
-
+func newStorageRESTClient(endpoint Endpoint) *storageRESTClient {
 	serverURL := &url.URL{
-		Scheme: scheme,
+		Scheme: endpoint.Scheme,
 		Host:   endpoint.Host,
-		Path:   path.Join(storageRESTPath, endpoint.Path),
+		Path:   path.Join(storageRESTPrefix, endpoint.Path, storageRESTVersion),
 	}
 
 	var tlsConfig *tls.Config
 	if globalIsSSL {
 		tlsConfig = &tls.Config{
-			ServerName: host.Name,
+			ServerName: endpoint.Hostname(),
 			RootCAs:    globalRootCAs,
 			NextProtos: []string{"http/1.1"}, // Force http1.1
 		}
 	}
 
-	restClient, err := rest.NewClient(serverURL, tlsConfig, rest.DefaultRESTTimeout, newAuthToken)
+	trFn := newCustomHTTPTransport(tlsConfig, rest.DefaultRESTTimeout, rest.DefaultRESTTimeout)
+	restClient, err := rest.NewClient(serverURL, trFn, newAuthToken)
 	if err != nil {
-		return nil, err
+		logger.LogIf(context.Background(), err)
+		return &storageRESTClient{endpoint: endpoint, restClient: restClient, connected: 0}
 	}
-	client := &storageRESTClient{endpoint: endpoint, restClient: restClient, connected: 1}
-	return client, nil
+	return &storageRESTClient{endpoint: endpoint, restClient: restClient, connected: 1}
 }

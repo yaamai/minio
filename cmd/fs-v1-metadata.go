@@ -90,6 +90,7 @@ func (c *FSChecksumInfoV1) UnmarshalJSON(data []byte) error {
 	}
 
 	var info checksuminfo
+	var json = jsoniter.ConfigCompatibleWithStandardLibrary
 	err := json.Unmarshal(data, &info)
 	if err != nil {
 		return err
@@ -142,7 +143,7 @@ func (m fsMetaV1) ToObjectInfo(bucket, object string, fi os.FileInfo) ObjectInfo
 		m.Meta["content-type"] = mimedb.TypeByExtension(pathutil.Ext(object))
 	}
 
-	if hasSuffix(object, SlashSeparator) {
+	if HasSuffix(object, SlashSeparator) {
 		m.Meta["etag"] = emptyETag // For directories etag is d41d8cd98f00b204e9800998ecf8427e
 		m.Meta["content-type"] = "application/octet-stream"
 	}

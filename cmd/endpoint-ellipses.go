@@ -30,11 +30,6 @@ import (
 // This file implements and supports ellipses pattern for
 // `minio server` command line arguments.
 
-// Maximum number of unique args supported on the command line.
-const (
-	serverCommandLineArgsMax = 32
-)
-
 // Endpoint set represents parsed ellipses values, also provides
 // methods to get the sets of endpoints.
 type endpointSet struct {
@@ -63,36 +58,26 @@ func getDivisibleSize(totalSizes []uint64) (result uint64) {
 	return result
 }
 
+// isValidSetSize - checks whether given count is a valid set size for erasure coding.
+var isValidSetSize = func(count uint64) bool {
+	return (count >= setSizes[0] && count <= setSizes[len(setSizes)-1] && count%2 == 0)
+}
+
 // getSetIndexes returns list of indexes which provides the set size
 // on each index, this function also determines the final set size
 // The final set size has the affinity towards choosing smaller
 // indexes (total sets)
-func getSetIndexes(args []string, totalSizes []uint64) (setIndexes [][]uint64, err error) {
+func getSetIndexes(args []string, totalSizes []uint64, customSetDriveCount uint64) (setIndexes [][]uint64, err error) {
 	if len(totalSizes) == 0 || len(args) == 0 {
 		return nil, errInvalidArgument
-	}
-
-	// isValidSetSize - checks whether given count is a valid set size for erasure coding.
-	isValidSetSize := func(count uint64) bool {
-		return (count >= setSizes[0] && count <= setSizes[len(setSizes)-1] && count%2 == 0)
-	}
-
-	var customSetDriveCount uint64
-	if v := env.Get("MINIO_ERASURE_SET_DRIVE_COUNT", ""); v != "" {
-		customSetDriveCount, err = strconv.ParseUint(v, 10, 64)
-		if err != nil {
-			return nil, config.ErrInvalidErasureSetSize(err)
-		}
-		if !isValidSetSize(customSetDriveCount) {
-			return nil, config.ErrInvalidErasureSetSize(nil)
-		}
 	}
 
 	setIndexes = make([][]uint64, len(totalSizes))
 	for _, totalSize := range totalSizes {
 		// Check if totalSize has minimum range upto setSize
 		if totalSize < setSizes[0] || totalSize < customSetDriveCount {
-			return nil, config.ErrInvalidNumberOfErasureEndpoints(nil)
+			msg := fmt.Sprintf("Incorrect number of endpoints provided %s", args)
+			return nil, config.ErrInvalidNumberOfErasureEndpoints(nil).Msg(msg)
 		}
 	}
 
@@ -136,7 +121,8 @@ func getSetIndexes(args []string, totalSizes []uint64) (setIndexes [][]uint64, e
 
 	// Check whether setSize is with the supported range.
 	if !isValidSetSize(setSize) {
-		return nil, config.ErrInvalidNumberOfErasureEndpoints(nil)
+		msg := fmt.Sprintf("Incorrect number of endpoints provided %s", args)
+		return nil, config.ErrInvalidNumberOfErasureEndpoints(nil).Msg(msg)
 	}
 
 	for i := range totalSizes {
@@ -194,7 +180,7 @@ func getTotalSizes(argPatterns []ellipses.ArgPattern) []uint64 {
 // Parses all arguments and returns an endpointSet which is a collection
 // of endpoints following the ellipses pattern, this is what is used
 // by the object layer for initializing itself.
-func parseEndpointSet(args ...string) (ep endpointSet, err error) {
+func parseEndpointSet(customSetDriveCount uint64, args ...string) (ep endpointSet, err error) {
 	var argPatterns = make([]ellipses.ArgPattern, len(args))
 	for i, arg := range args {
 		patterns, perr := ellipses.FindEllipsesPatterns(arg)
@@ -204,7 +190,7 @@ func parseEndpointSet(args ...string) (ep endpointSet, err error) {
 		argPatterns[i] = patterns
 	}
 
-	ep.setIndexes, err = getSetIndexes(args, getTotalSizes(argPatterns))
+	ep.setIndexes, err = getSetIndexes(args, getTotalSizes(argPatterns), customSetDriveCount)
 	if err != nil {
 		return endpointSet{}, config.ErrInvalidErasureEndpoints(nil).Msg(err.Error())
 	}
@@ -219,18 +205,14 @@ func parseEndpointSet(args ...string) (ep endpointSet, err error) {
 // specific set size.
 // For example: {1...64} is divided into 4 sets each of size 16.
 // This applies to even distributed setup syntax as well.
-func GetAllSets(args ...string) ([][]string, error) {
-	if len(args) == 0 {
-		return nil, errInvalidArgument
-	}
-
+func GetAllSets(customSetDriveCount uint64, args ...string) ([][]string, error) {
 	var setArgs [][]string
 	if !ellipses.HasEllipses(args...) {
 		var setIndexes [][]uint64
 		// Check if we have more one args.
 		if len(args) > 1 {
 			var err error
-			setIndexes, err = getSetIndexes(args, []uint64{uint64(len(args))})
+			setIndexes, err = getSetIndexes(args, []uint64{uint64(len(args))}, customSetDriveCount)
 			if err != nil {
 				return nil, err
 			}
@@ -244,7 +226,7 @@ func GetAllSets(args ...string) ([][]string, error) {
 		}
 		setArgs = s.Get()
 	} else {
-		s, err := parseEndpointSet(args...)
+		s, err := parseEndpointSet(customSetDriveCount, args...)
 		if err != nil {
 			return nil, err
 		}
@@ -266,18 +248,73 @@ func GetAllSets(args ...string) ([][]string, error) {
 
 // CreateServerEndpoints - validates and creates new endpoints from input args, supports
 // both ellipses and without ellipses transparently.
-func createServerEndpoints(serverAddr string, args ...string) (string, EndpointList, SetupType, int, int, error) {
-	setArgs, err := GetAllSets(args...)
-	if err != nil {
-		return serverAddr, nil, -1, 0, 0, err
+func createServerEndpoints(serverAddr string, args ...string) (
+	endpointZones EndpointZones, setDriveCount int,
+	setupType SetupType, err error) {
+
+	if len(args) == 0 {
+		return nil, -1, -1, errInvalidArgument
 	}
 
-	var endpoints EndpointList
-	var setupType SetupType
-	serverAddr, endpoints, setupType, err = CreateEndpoints(serverAddr, setArgs...)
-	if err != nil {
-		return serverAddr, nil, -1, 0, 0, err
+	if v := env.Get("MINIO_ERASURE_SET_DRIVE_COUNT", ""); v != "" {
+		setDriveCount, err = strconv.Atoi(v)
+		if err != nil {
+			return nil, -1, -1, config.ErrInvalidErasureSetSize(err)
+		}
+		if !isValidSetSize(uint64(setDriveCount)) {
+			return nil, -1, -1, config.ErrInvalidErasureSetSize(nil)
+		}
 	}
 
-	return serverAddr, endpoints, setupType, len(setArgs), len(setArgs[0]), nil
+	if !ellipses.HasEllipses(args...) {
+		setArgs, err := GetAllSets(uint64(setDriveCount), args...)
+		if err != nil {
+			return nil, -1, -1, err
+		}
+		endpointList, newSetupType, err := CreateEndpoints(serverAddr, false, setArgs...)
+		if err != nil {
+			return nil, -1, -1, err
+		}
+		endpointZones = append(endpointZones, ZoneEndpoints{
+			SetCount:     len(setArgs),
+			DrivesPerSet: len(setArgs[0]),
+			Endpoints:    endpointList,
+		})
+		setupType = newSetupType
+		return endpointZones, len(setArgs[0]), setupType, nil
+	}
+
+	var prevSetupType SetupType
+	var foundPrevLocal bool
+	for _, arg := range args {
+		setArgs, err := GetAllSets(uint64(setDriveCount), arg)
+		if err != nil {
+			return nil, -1, -1, err
+		}
+		var endpointList Endpoints
+		endpointList, setupType, err = CreateEndpoints(serverAddr, foundPrevLocal, setArgs...)
+		if err != nil {
+			return nil, -1, -1, err
+		}
+		if setDriveCount != 0 && setDriveCount != len(setArgs[0]) {
+			return nil, -1, -1, fmt.Errorf("All zones should have same drive per set ratio - expected %d, got %d", setDriveCount, len(setArgs[0]))
+		}
+		if prevSetupType != UnknownSetupType && prevSetupType != setupType {
+			return nil, -1, -1, fmt.Errorf("All zones should be of the same setup-type to maintain the original SLA expectations - expected %s, got %s", prevSetupType, setupType)
+		}
+		if err = endpointZones.Add(ZoneEndpoints{
+			SetCount:     len(setArgs),
+			DrivesPerSet: len(setArgs[0]),
+			Endpoints:    endpointList,
+		}); err != nil {
+			return nil, -1, -1, err
+		}
+		foundPrevLocal = endpointList.atleastOneEndpointLocal()
+		if setDriveCount == 0 {
+			setDriveCount = len(setArgs[0])
+		}
+		prevSetupType = setupType
+	}
+
+	return endpointZones, setDriveCount, setupType, nil
 }

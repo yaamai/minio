@@ -17,11 +17,12 @@
 package crypto
 
 import (
-	"fmt"
+	"reflect"
 	"strconv"
 
 	"github.com/minio/minio/cmd/config"
 	"github.com/minio/minio/pkg/env"
+	xnet "github.com/minio/minio/pkg/net"
 )
 
 const (
@@ -39,65 +40,85 @@ const (
 )
 
 const (
-	// EnvVaultEndpoint is the environment variable used to specify
+	// EnvLegacyVaultEndpoint is the environment variable used to specify
 	// the vault HTTPS endpoint.
-	EnvVaultEndpoint = "MINIO_SSE_VAULT_ENDPOINT"
+	EnvLegacyVaultEndpoint = "MINIO_SSE_VAULT_ENDPOINT"
 
-	// EnvVaultAuthType is the environment variable used to specify
+	// EnvLegacyVaultAuthType is the environment variable used to specify
 	// the authentication type for vault.
-	EnvVaultAuthType = "MINIO_SSE_VAULT_AUTH_TYPE"
+	EnvLegacyVaultAuthType = "MINIO_SSE_VAULT_AUTH_TYPE"
 
-	// EnvVaultAppRoleID is the environment variable used to specify
+	// EnvLegacyVaultAppRoleID is the environment variable used to specify
 	// the vault AppRole ID.
-	EnvVaultAppRoleID = "MINIO_SSE_VAULT_APPROLE_ID"
+	EnvLegacyVaultAppRoleID = "MINIO_SSE_VAULT_APPROLE_ID"
 
-	// EnvVaultAppSecretID is the environment variable used to specify
+	// EnvLegacyVaultAppSecretID is the environment variable used to specify
 	// the vault AppRole secret corresponding to the AppRole ID.
-	EnvVaultAppSecretID = "MINIO_SSE_VAULT_APPROLE_SECRET"
+	EnvLegacyVaultAppSecretID = "MINIO_SSE_VAULT_APPROLE_SECRET"
 
-	// EnvVaultKeyVersion is the environment variable used to specify
+	// EnvLegacyVaultKeyVersion is the environment variable used to specify
 	// the vault key version.
-	EnvVaultKeyVersion = "MINIO_SSE_VAULT_KEY_VERSION"
+	EnvLegacyVaultKeyVersion = "MINIO_SSE_VAULT_KEY_VERSION"
 
-	// EnvVaultKeyName is the environment variable used to specify
+	// EnvLegacyVaultKeyName is the environment variable used to specify
 	// the vault named key-ring. In the S3 context it's referred as
 	// customer master key ID (CMK-ID).
-	EnvVaultKeyName = "MINIO_SSE_VAULT_KEY_NAME"
+	EnvLegacyVaultKeyName = "MINIO_SSE_VAULT_KEY_NAME"
 
-	// EnvVaultCAPath is the environment variable used to specify the
+	// EnvLegacyVaultCAPath is the environment variable used to specify the
 	// path to a directory of PEM-encoded CA cert files. These CA cert
 	// files are used to authenticate MinIO to Vault over mTLS.
-	EnvVaultCAPath = "MINIO_SSE_VAULT_CAPATH"
+	EnvLegacyVaultCAPath = "MINIO_SSE_VAULT_CAPATH"
 
-	// EnvVaultNamespace is the environment variable used to specify
+	// EnvLegacyVaultNamespace is the environment variable used to specify
 	// vault namespace. The vault namespace is used if the enterprise
 	// version of Hashicorp Vault is used.
-	EnvVaultNamespace = "MINIO_SSE_VAULT_NAMESPACE"
+	EnvLegacyVaultNamespace = "MINIO_SSE_VAULT_NAMESPACE"
 )
 
 // SetKMSConfig helper to migrate from older KMSConfig to new KV.
 func SetKMSConfig(s config.Config, cfg KMSConfig) {
+	if cfg.Vault.Endpoint == "" {
+		return
+	}
 	s[config.KmsVaultSubSys][config.Default] = config.KVS{
-		KMSVaultEndpoint: cfg.Vault.Endpoint,
-		KMSVaultCAPath:   cfg.Vault.CAPath,
-		KMSVaultAuthType: func() string {
-			if cfg.Vault.Auth.Type != "" {
-				return cfg.Vault.Auth.Type
-			}
-			return "approle"
-		}(),
-		KMSVaultAppRoleID:     cfg.Vault.Auth.AppRole.ID,
-		KMSVaultAppRoleSecret: cfg.Vault.Auth.AppRole.Secret,
-		KMSVaultKeyName:       cfg.Vault.Key.Name,
-		KMSVaultKeyVersion:    strconv.Itoa(cfg.Vault.Key.Version),
-		KMSVaultNamespace:     cfg.Vault.Namespace,
-		config.State: func() string {
-			if !cfg.Vault.IsEmpty() {
-				return config.StateOn
-			}
-			return config.StateOff
-		}(),
-		config.Comment: "Settings for KMS Vault, after migrating config",
+		config.KV{
+			Key:   KMSVaultEndpoint,
+			Value: cfg.Vault.Endpoint,
+		},
+		config.KV{
+			Key:   KMSVaultCAPath,
+			Value: cfg.Vault.CAPath,
+		},
+		config.KV{
+			Key: KMSVaultAuthType,
+			Value: func() string {
+				if cfg.Vault.Auth.Type != "" {
+					return cfg.Vault.Auth.Type
+				}
+				return "approle"
+			}(),
+		},
+		config.KV{
+			Key:   KMSVaultAppRoleID,
+			Value: cfg.Vault.Auth.AppRole.ID,
+		},
+		config.KV{
+			Key:   KMSVaultAppRoleSecret,
+			Value: cfg.Vault.Auth.AppRole.Secret,
+		},
+		config.KV{
+			Key:   KMSVaultKeyName,
+			Value: cfg.Vault.Key.Name,
+		},
+		config.KV{
+			Key:   KMSVaultKeyVersion,
+			Value: strconv.Itoa(cfg.Vault.Key.Version),
+		},
+		config.KV{
+			Key:   KMSVaultNamespace,
+			Value: cfg.Vault.Namespace,
+		},
 	}
 }
 
@@ -114,47 +135,50 @@ func SetKMSConfig(s config.Config, cfg KMSConfig) {
 //
 // It sets the global KMS configuration according to the merged configuration
 // on success.
-func lookupConfigLegacy(kvs config.KVS) (KMSConfig, error) {
-	autoBool, err := config.ParseBool(env.Get(EnvAutoEncryptionLegacy, config.StateOff))
-	if err != nil {
-		return KMSConfig{}, err
+func lookupConfigLegacy(kvs config.KVS) (VaultConfig, error) {
+	vcfg := VaultConfig{
+		Auth: VaultAuth{
+			Type: "approle",
+		},
 	}
-	cfg := KMSConfig{
-		AutoEncryption: autoBool,
-	}
-	// Assume default as "on" for legacy config since we didn't have a _STATE
-	// flag to turn it off, but we should honor it nonetheless to turn it off
-	// if the vault endpoint is down and there is no way to start the server.
-	stateBool, err := config.ParseBool(env.Get(EnvKMSVaultState, config.StateOn))
-	if err != nil {
-		return cfg, err
-	}
-	if !stateBool {
-		return cfg, nil
-	}
-	vcfg := VaultConfig{}
-	// Lookup Hashicorp-Vault configuration & overwrite config entry if ENV var is present
-	vcfg.Endpoint = env.Get(EnvVaultEndpoint, kvs.Get(KMSVaultEndpoint))
-	vcfg.CAPath = env.Get(EnvVaultCAPath, kvs.Get(KMSVaultCAPath))
-	vcfg.Auth.Type = env.Get(EnvVaultAuthType, kvs.Get(KMSVaultAuthType))
-	vcfg.Auth.AppRole.ID = env.Get(EnvVaultAppRoleID, kvs.Get(KMSVaultAppRoleID))
-	vcfg.Auth.AppRole.Secret = env.Get(EnvVaultAppSecretID, kvs.Get(KMSVaultAppRoleSecret))
-	vcfg.Key.Name = env.Get(EnvVaultKeyName, kvs.Get(KMSVaultKeyName))
-	vcfg.Namespace = env.Get(EnvVaultNamespace, kvs.Get(KMSVaultNamespace))
-	keyVersion := env.Get(EnvVaultKeyVersion, kvs.Get(KMSVaultKeyVersion))
 
-	if keyVersion != "" {
+	endpointStr := env.Get(EnvLegacyVaultEndpoint, "")
+	if endpointStr != "" {
+		// Lookup Hashicorp-Vault configuration & overwrite config entry if ENV var is present
+		endpoint, err := xnet.ParseHTTPURL(endpointStr)
+		if err != nil {
+			return vcfg, err
+		}
+		endpointStr = endpoint.String()
+	}
+
+	var err error
+	vcfg.Endpoint = endpointStr
+	vcfg.CAPath = env.Get(EnvLegacyVaultCAPath, "")
+	vcfg.Auth.Type = env.Get(EnvLegacyVaultAuthType, "")
+	if vcfg.Auth.Type == "" {
+		vcfg.Auth.Type = "approle"
+	}
+	vcfg.Auth.AppRole.ID = env.Get(EnvLegacyVaultAppRoleID, "")
+	vcfg.Auth.AppRole.Secret = env.Get(EnvLegacyVaultAppSecretID, "")
+	vcfg.Key.Name = env.Get(EnvLegacyVaultKeyName, "")
+	vcfg.Namespace = env.Get(EnvLegacyVaultNamespace, "")
+	if keyVersion := env.Get(EnvLegacyVaultKeyVersion, ""); keyVersion != "" {
 		vcfg.Key.Version, err = strconv.Atoi(keyVersion)
 		if err != nil {
-			return cfg, fmt.Errorf("Invalid ENV variable: Unable to parse %s value (`%s`)",
-				EnvVaultKeyVersion, keyVersion)
+			return vcfg, Errorf("Invalid ENV variable: Unable to parse %s value (`%s`)",
+				EnvLegacyVaultKeyVersion, keyVersion)
 		}
 	}
 
-	if err = vcfg.Verify(); err != nil {
-		return cfg, err
+	if reflect.DeepEqual(vcfg, defaultVaultCfg) {
+		return vcfg, nil
 	}
 
-	cfg.Vault = vcfg
-	return cfg, nil
+	if err = vcfg.Verify(); err != nil {
+		return vcfg, err
+	}
+
+	vcfg.Enabled = true
+	return vcfg, nil
 }

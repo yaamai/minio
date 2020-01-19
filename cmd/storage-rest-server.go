@@ -24,8 +24,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os/user"
 	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -112,6 +114,25 @@ func (s *storageRESTServer) DiskInfoHandler(w http.ResponseWriter, r *http.Reque
 	gob.NewEncoder(w).Encode(info)
 }
 
+func (s *storageRESTServer) CrawlAndGetDataUsageHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.IsValid(w, r) {
+		return
+	}
+
+	w.Header().Set(xhttp.ContentType, "text/event-stream")
+	doneCh := sendWhiteSpaceToHTTPResponse(w)
+	usageInfo, err := s.storage.CrawlAndGetDataUsage(GlobalServiceDoneCh)
+	<-doneCh
+
+	if err != nil {
+		s.writeErrorResponse(w, err)
+		return
+	}
+
+	gob.NewEncoder(w).Encode(usageInfo)
+	w.(http.Flusher).Flush()
+}
+
 // MakeVolHandler - make a volume.
 func (s *storageRESTServer) MakeVolHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
@@ -120,6 +141,19 @@ func (s *storageRESTServer) MakeVolHandler(w http.ResponseWriter, r *http.Reques
 	vars := mux.Vars(r)
 	volume := vars[storageRESTVolume]
 	err := s.storage.MakeVol(volume)
+	if err != nil {
+		s.writeErrorResponse(w, err)
+	}
+}
+
+// MakeVolBulkHandler - create multiple volumes as a bulk operation.
+func (s *storageRESTServer) MakeVolBulkHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.IsValid(w, r) {
+		return
+	}
+	vars := mux.Vars(r)
+	volumes := strings.Split(vars[storageRESTVolumes], ",")
+	err := s.storage.MakeVolBulk(volumes...)
 	if err != nil {
 		s.writeErrorResponse(w, err)
 	}
@@ -440,13 +474,6 @@ type DeleteFileBulkErrsResp struct {
 	Errs []error
 }
 
-// DeleteFileError - error captured per delete operation
-type DeleteFileError string
-
-func (d DeleteFileError) Error() string {
-	return string(d)
-}
-
 // DeleteFileBulkHandler - delete a file.
 func (s *storageRESTServer) DeleteFileBulkHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
@@ -465,7 +492,7 @@ func (s *storageRESTServer) DeleteFileBulkHandler(w http.ResponseWriter, r *http
 	derrsResp := &DeleteFileBulkErrsResp{Errs: make([]error, len(errs))}
 	for idx, err := range errs {
 		if err != nil {
-			derrsResp.Errs[idx] = DeleteFileError(err.Error())
+			derrsResp.Errs[idx] = StorageErr(err.Error())
 		}
 	}
 
@@ -489,8 +516,9 @@ func (s *storageRESTServer) RenameFileHandler(w http.ResponseWriter, r *http.Req
 	}
 }
 
-// Send whitespace to the client to avoid timeouts as bitrot verification can take time on spinning/slow disks.
-func sendWhiteSpaceVerifyFile(w http.ResponseWriter) <-chan struct{} {
+// Send whitespace to the client to avoid timeouts with long storage
+// operations, such as bitrot verification or data usage crawling.
+func sendWhiteSpaceToHTTPResponse(w http.ResponseWriter) <-chan struct{} {
 	doneCh := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(time.Second * 10)
@@ -548,68 +576,79 @@ func (s *storageRESTServer) VerifyFile(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set(xhttp.ContentType, "text/event-stream")
 	encoder := gob.NewEncoder(w)
-	doneCh := sendWhiteSpaceVerifyFile(w)
+	doneCh := sendWhiteSpaceToHTTPResponse(w)
 	err = s.storage.VerifyFile(volume, filePath, size, BitrotAlgorithmFromString(algoStr), hash, int64(shardSize))
 	<-doneCh
 	vresp := &VerifyFileResp{}
 	if err != nil {
-		vresp.Err = VerifyFileError(err.Error())
+		vresp.Err = StorageErr(err.Error())
 	}
 	encoder.Encode(vresp)
 	w.(http.Flusher).Flush()
 }
 
 // registerStorageRPCRouter - register storage rpc router.
-func registerStorageRESTHandlers(router *mux.Router, endpoints EndpointList) {
-	for _, endpoint := range endpoints {
-		if !endpoint.IsLocal {
-			continue
+func registerStorageRESTHandlers(router *mux.Router, endpointZones EndpointZones) {
+	for _, ep := range endpointZones {
+		for _, endpoint := range ep.Endpoints {
+			if !endpoint.IsLocal {
+				continue
+			}
+			storage, err := newPosix(endpoint.Path)
+			if err != nil {
+				// Show a descriptive error with a hint about how to fix it.
+				var username string
+				if u, err := user.Current(); err == nil {
+					username = u.Username
+				} else {
+					username = "<your-username>"
+				}
+				hint := fmt.Sprintf("Run the following command to add the convenient permissions: `sudo chown %s %s && sudo chmod u+rxw %s`",
+					username, endpoint.Path, endpoint.Path)
+				logger.Fatal(config.ErrUnableToWriteInBackend(err).Hint(hint),
+					"Unable to initialize posix backend")
+			}
+
+			server := &storageRESTServer{storage: storage}
+
+			subrouter := router.PathPrefix(path.Join(storageRESTPrefix, endpoint.Path)).Subrouter()
+
+			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodDiskInfo).HandlerFunc(httpTraceHdrs(server.DiskInfoHandler))
+			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodCrawlAndGetDataUsage).HandlerFunc(httpTraceHdrs(server.CrawlAndGetDataUsageHandler))
+			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodMakeVol).HandlerFunc(httpTraceHdrs(server.MakeVolHandler)).Queries(restQueries(storageRESTVolume)...)
+			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodMakeVolBulk).HandlerFunc(httpTraceHdrs(server.MakeVolBulkHandler)).Queries(restQueries(storageRESTVolumes)...)
+			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodStatVol).HandlerFunc(httpTraceHdrs(server.StatVolHandler)).Queries(restQueries(storageRESTVolume)...)
+			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodDeleteVol).HandlerFunc(httpTraceHdrs(server.DeleteVolHandler)).Queries(restQueries(storageRESTVolume)...)
+			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodListVols).HandlerFunc(httpTraceHdrs(server.ListVolsHandler))
+
+			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodAppendFile).HandlerFunc(httpTraceHdrs(server.AppendFileHandler)).
+				Queries(restQueries(storageRESTVolume, storageRESTFilePath)...)
+			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodWriteAll).HandlerFunc(httpTraceHdrs(server.WriteAllHandler)).
+				Queries(restQueries(storageRESTVolume, storageRESTFilePath)...)
+			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodCreateFile).HandlerFunc(httpTraceHdrs(server.CreateFileHandler)).
+				Queries(restQueries(storageRESTVolume, storageRESTFilePath, storageRESTLength)...)
+
+			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodStatFile).HandlerFunc(httpTraceHdrs(server.StatFileHandler)).
+				Queries(restQueries(storageRESTVolume, storageRESTFilePath)...)
+			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodReadAll).HandlerFunc(httpTraceHdrs(server.ReadAllHandler)).
+				Queries(restQueries(storageRESTVolume, storageRESTFilePath)...)
+			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodReadFile).HandlerFunc(httpTraceHdrs(server.ReadFileHandler)).
+				Queries(restQueries(storageRESTVolume, storageRESTFilePath, storageRESTOffset, storageRESTLength, storageRESTBitrotAlgo, storageRESTBitrotHash)...)
+			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodReadFileStream).HandlerFunc(httpTraceHdrs(server.ReadFileStreamHandler)).
+				Queries(restQueries(storageRESTVolume, storageRESTFilePath, storageRESTOffset, storageRESTLength)...)
+			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodListDir).HandlerFunc(httpTraceHdrs(server.ListDirHandler)).
+				Queries(restQueries(storageRESTVolume, storageRESTDirPath, storageRESTCount, storageRESTLeafFile)...)
+			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodWalk).HandlerFunc(httpTraceHdrs(server.WalkHandler)).
+				Queries(restQueries(storageRESTVolume, storageRESTDirPath, storageRESTMarkerPath, storageRESTRecursive, storageRESTLeafFile)...)
+			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodDeleteFile).HandlerFunc(httpTraceHdrs(server.DeleteFileHandler)).
+				Queries(restQueries(storageRESTVolume, storageRESTFilePath)...)
+			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodDeleteFileBulk).HandlerFunc(httpTraceHdrs(server.DeleteFileBulkHandler)).
+				Queries(restQueries(storageRESTVolume, storageRESTFilePath)...)
+
+			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodRenameFile).HandlerFunc(httpTraceHdrs(server.RenameFileHandler)).
+				Queries(restQueries(storageRESTSrcVolume, storageRESTSrcPath, storageRESTDstVolume, storageRESTDstPath)...)
+			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodVerifyFile).HandlerFunc(httpTraceHdrs(server.VerifyFile)).
+				Queries(restQueries(storageRESTVolume, storageRESTFilePath, storageRESTBitrotAlgo, storageRESTBitrotHash, storageRESTLength, storageRESTShardSize)...)
 		}
-		storage, err := newPosix(endpoint.Path)
-		if err != nil {
-			logger.Fatal(config.ErrUnableToWriteInBackend(err),
-				"Unable to initialize posix backend")
-		}
-
-		server := &storageRESTServer{storage: storage}
-
-		subrouter := router.PathPrefix(path.Join(storageRESTPath, endpoint.Path)).Subrouter()
-
-		subrouter.Methods(http.MethodPost).Path(SlashSeparator + storageRESTMethodDiskInfo).HandlerFunc(httpTraceHdrs(server.DiskInfoHandler))
-		subrouter.Methods(http.MethodPost).Path(SlashSeparator + storageRESTMethodMakeVol).HandlerFunc(httpTraceHdrs(server.MakeVolHandler)).Queries(restQueries(storageRESTVolume)...)
-		subrouter.Methods(http.MethodPost).Path(SlashSeparator + storageRESTMethodStatVol).HandlerFunc(httpTraceHdrs(server.StatVolHandler)).Queries(restQueries(storageRESTVolume)...)
-		subrouter.Methods(http.MethodPost).Path(SlashSeparator + storageRESTMethodDeleteVol).HandlerFunc(httpTraceHdrs(server.DeleteVolHandler)).Queries(restQueries(storageRESTVolume)...)
-		subrouter.Methods(http.MethodPost).Path(SlashSeparator + storageRESTMethodListVols).HandlerFunc(httpTraceHdrs(server.ListVolsHandler))
-
-		subrouter.Methods(http.MethodPost).Path(SlashSeparator + storageRESTMethodAppendFile).HandlerFunc(httpTraceHdrs(server.AppendFileHandler)).
-			Queries(restQueries(storageRESTVolume, storageRESTFilePath)...)
-		subrouter.Methods(http.MethodPost).Path(SlashSeparator + storageRESTMethodWriteAll).HandlerFunc(httpTraceHdrs(server.WriteAllHandler)).
-			Queries(restQueries(storageRESTVolume, storageRESTFilePath)...)
-		subrouter.Methods(http.MethodPost).Path(SlashSeparator + storageRESTMethodCreateFile).HandlerFunc(httpTraceHdrs(server.CreateFileHandler)).
-			Queries(restQueries(storageRESTVolume, storageRESTFilePath, storageRESTLength)...)
-
-		subrouter.Methods(http.MethodPost).Path(SlashSeparator + storageRESTMethodStatFile).HandlerFunc(httpTraceHdrs(server.StatFileHandler)).
-			Queries(restQueries(storageRESTVolume, storageRESTFilePath)...)
-		subrouter.Methods(http.MethodPost).Path(SlashSeparator + storageRESTMethodReadAll).HandlerFunc(httpTraceHdrs(server.ReadAllHandler)).
-			Queries(restQueries(storageRESTVolume, storageRESTFilePath)...)
-		subrouter.Methods(http.MethodPost).Path(SlashSeparator + storageRESTMethodReadFile).HandlerFunc(httpTraceHdrs(server.ReadFileHandler)).
-			Queries(restQueries(storageRESTVolume, storageRESTFilePath, storageRESTOffset, storageRESTLength, storageRESTBitrotAlgo, storageRESTBitrotHash)...)
-		subrouter.Methods(http.MethodPost).Path(SlashSeparator + storageRESTMethodReadFileStream).HandlerFunc(httpTraceHdrs(server.ReadFileStreamHandler)).
-			Queries(restQueries(storageRESTVolume, storageRESTFilePath, storageRESTOffset, storageRESTLength)...)
-		subrouter.Methods(http.MethodPost).Path(SlashSeparator + storageRESTMethodListDir).HandlerFunc(httpTraceHdrs(server.ListDirHandler)).
-			Queries(restQueries(storageRESTVolume, storageRESTDirPath, storageRESTCount, storageRESTLeafFile)...)
-		subrouter.Methods(http.MethodPost).Path(SlashSeparator + storageRESTMethodWalk).HandlerFunc(httpTraceHdrs(server.WalkHandler)).
-			Queries(restQueries(storageRESTVolume, storageRESTDirPath, storageRESTMarkerPath, storageRESTRecursive, storageRESTLeafFile)...)
-		subrouter.Methods(http.MethodPost).Path(SlashSeparator + storageRESTMethodDeleteFile).HandlerFunc(httpTraceHdrs(server.DeleteFileHandler)).
-			Queries(restQueries(storageRESTVolume, storageRESTFilePath)...)
-		subrouter.Methods(http.MethodPost).Path(SlashSeparator + storageRESTMethodDeleteFileBulk).HandlerFunc(httpTraceHdrs(server.DeleteFileBulkHandler)).
-			Queries(restQueries(storageRESTVolume, storageRESTFilePath)...)
-
-		subrouter.Methods(http.MethodPost).Path(SlashSeparator + storageRESTMethodRenameFile).HandlerFunc(httpTraceHdrs(server.RenameFileHandler)).
-			Queries(restQueries(storageRESTSrcVolume, storageRESTSrcPath, storageRESTDstVolume, storageRESTDstPath)...)
-		subrouter.Methods(http.MethodPost).Path(SlashSeparator + storageRESTMethodVerifyFile).HandlerFunc(httpTraceHdrs(server.VerifyFile)).
-			Queries(restQueries(storageRESTVolume, storageRESTFilePath, storageRESTBitrotAlgo, storageRESTBitrotHash, storageRESTLength, storageRESTShardSize)...)
 	}
-
-	router.MethodNotAllowedHandler = http.HandlerFunc(httpTraceAll(versionMismatchHandler))
 }

@@ -27,6 +27,7 @@ import (
 	humanize "github.com/dustin/go-humanize"
 	"github.com/minio/minio/cmd/config/cache"
 	"github.com/minio/minio/cmd/config/compress"
+	"github.com/minio/minio/cmd/config/etcd/dns"
 	xldap "github.com/minio/minio/cmd/config/identity/ldap"
 	"github.com/minio/minio/cmd/config/identity/openid"
 	"github.com/minio/minio/cmd/config/policy/opa"
@@ -35,7 +36,8 @@ import (
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/pkg/auth"
 	"github.com/minio/minio/pkg/certs"
-	"github.com/minio/minio/pkg/dns"
+	"github.com/minio/minio/pkg/event"
+	"github.com/minio/minio/pkg/objectlock"
 	"github.com/minio/minio/pkg/pubsub"
 )
 
@@ -103,9 +105,6 @@ var globalCLIContext = struct {
 }{}
 
 var (
-	// Indicates the total number of erasure coded sets configured.
-	globalXLSetCount int
-
 	// Indicates set drive count.
 	globalXLSetDriveCount int
 
@@ -130,9 +129,6 @@ var (
 	// This flag is set to 'us-east-1' by default
 	globalServerRegion = globalMinioDefaultRegion
 
-	// Maximum size of internal objects parts
-	globalPutPartSize = int64(64 * 1024 * 1024)
-
 	// MinIO local server address (in `host:port` format)
 	globalMinioAddr = ""
 	// MinIO default port, can be changed through command line.
@@ -143,9 +139,10 @@ var (
 	// globalConfigSys server config system.
 	globalConfigSys *ConfigSys
 
-	globalNotificationSys *NotificationSys
-	globalPolicySys       *PolicySys
-	globalIAMSys          *IAMSys
+	globalNotificationSys  *NotificationSys
+	globalConfigTargetList *event.TargetList
+	globalPolicySys        *PolicySys
+	globalIAMSys           *IAMSys
 
 	globalLifecycleSys *LifecycleSys
 
@@ -169,11 +166,14 @@ var (
 	// registered listeners
 	globalHTTPTrace = pubsub.New()
 
+	// global Listen system to send S3 API events to registered listeners
+	globalHTTPListen = pubsub.New()
+
 	// global console system to send console logs to
 	// registered listeners
 	globalConsoleSys *HTTPConsoleLoggerSys
 
-	globalEndpoints EndpointList
+	globalEndpoints EndpointZones
 
 	// Global server's network statistics
 	globalConnStats = newConnStats()
@@ -185,6 +185,9 @@ var (
 	globalBootTime time.Time
 
 	globalActiveCred auth.Credentials
+
+	// Indicates if config is to be encrypted
+	globalConfigEncrypted bool
 
 	globalPublicCerts []*x509.Certificate
 
@@ -199,6 +202,8 @@ var (
 	// Is worm enabled
 	globalWORMEnabled bool
 
+	globalBucketObjectLockConfig = objectlock.NewBucketObjectLockConfig()
+
 	// Disk cache drives
 	globalCacheConfig cache.Config
 
@@ -208,8 +213,12 @@ var (
 	// Allocated etcd endpoint for config and bucket DNS.
 	globalEtcdClient *etcd.Client
 
+	// Is set to true when Bucket federation is requested
+	// and is 'true' when etcdConfig.PathPrefix is empty
+	globalBucketFederation bool
+
 	// Allocated DNS config wrapper over etcd client.
-	globalDNSConfig dns.Config
+	globalDNSConfig *dns.CoreDNS
 
 	// Default usage check interval value.
 	globalDefaultUsageCheckInterval = 12 * time.Hour // 12 hours
@@ -251,6 +260,11 @@ var (
 	globalBackgroundHealRoutine *healRoutine
 	globalBackgroundHealState   *allHealState
 
+	// Only enabled when one of the sub-systems fail
+	// to initialize, this allows for administrators to
+	// fix the system.
+	globalSafeMode bool
+
 	// Add new variable global values here.
 )
 
@@ -259,7 +273,6 @@ var (
 // list. Feel free to add new relevant fields.
 func getGlobalInfo() (globalInfo map[string]interface{}) {
 	globalInfo = map[string]interface{}{
-		"isWorm":       globalWORMEnabled,
 		"serverRegion": globalServerRegion,
 		// Add more relevant global settings here.
 	}

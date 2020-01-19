@@ -32,7 +32,7 @@ $ mc tree --files ~/.minio
 You can provide a custom certs directory using `--certs-dir` command line option.
 
 #### Credentials
-On MinIO admin credentials or root credentials are only allowed to be changed using ENVs `MINIO_ACCESS_KEY` and `MINIO_SECRET_KEY`.
+On MinIO admin credentials or root credentials are only allowed to be changed using ENVs namely `MINIO_ACCESS_KEY` and `MINIO_SECRET_KEY`. Using the combination of these two values MinIO encrypts the config stored at the backend.
 
 ```
 export MINIO_ACCESS_KEY=minio
@@ -40,10 +40,43 @@ export MINIO_SECRET_KEY=minio13
 minio server /data
 ```
 
+##### Rotating encryption with new credentials
+
+Additionally if you wish to change the admin credentials, then MinIO will automatically detect this and re-encrypt with new credentials as shown below. For one time only special ENVs as shown below needs to be set for rotating the encryption config.
+
+> Old ENVs are never remembered in memory and are destroyed right after they are used to migrate your existing content with new credentials. You are safe to remove them after the server as successfully started, by restarting the services once again.
+
+```
+export MINIO_ACCESS_KEY=newminio
+export MINIO_SECRET_KEY=newminio123
+export MINIO_ACCESS_KEY_OLD=minio
+export MINIO_SECRET_KEY_OLD=minio123
+minio server /data
+```
+
+Once the migration is complete, server will automatically unset the `MINIO_ACCESS_KEY_OLD` and `MINIO_SECRET_KEY_OLD` with in the process namespace.
+
+> **NOTE: Make sure to remove `MINIO_ACCESS_KEY_OLD` and `MINIO_SECRET_KEY_OLD` in scripts or service files before next service restarts of the server to avoid double encryption of your existing contents.**
+
 #### Region
-| Field                     | Type     | Description                                                                                                                                                                             |
-|:--------------------------|:---------|:----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| ``region name=my_region`` | _string_ | `region` describes the physical location of the server. By default it is blank. You may override this field with `MINIO_REGION_NAME` environment variable. If you are unsure leave it unset. |
+```
+KEY:
+region  label the location of the server
+
+ARGS:
+name     (string)    name of the location of the server e.g. "us-west-rack2"
+comment  (sentence)  optionally add a comment to this setting
+```
+
+or environment variables
+```
+KEY:
+region  label the location of the server
+
+ARGS:
+MINIO_REGION_NAME     (string)    name of the location of the server e.g. "us-west-rack2"
+MINIO_REGION_COMMENT  (sentence)  optionally add a comment to this setting
+```
 
 Example:
 
@@ -52,56 +85,163 @@ export MINIO_REGION_NAME="my_region"
 minio server /data
 ```
 
-#### Worm
+### Storage Class
+By default, parity for objects with standard storage class is set to `N/2`, and parity for objects with reduced redundancy storage class objects is set to `2`. Read more about storage class support in MinIO server [here](https://github.com/minio/minio/blob/master/docs/erasure/storage-class/README.md).
 
-| Field                  | Type     | Description                                                                                                                                       |
-|:-----------------------|:---------|:--------------------------------------------------------------------------------------------------------------------------------------------------|
-| ``worm state=on`` | _string_ | Enable this to turn on Write-Once-Read-Many. By default it is set to `off`. You may override this field with ``MINIO_WORM`` environment variable. |
+```
+KEY:
+storage_class  define object level redundancy
+
+ARGS:
+standard  (string)    set the parity count for default standard storage class e.g. "EC:4"
+rrs       (string)    set the parity count for reduced redundancy storage class e.g. "EC:2"
+comment   (sentence)  optionally add a comment to this setting
+```
+
+or environment variables
+```
+KEY:
+storage_class  define object level redundancy
+
+ARGS:
+MINIO_STORAGE_CLASS_STANDARD  (string)    set the parity count for default standard storage class e.g. "EC:4"
+MINIO_STORAGE_CLASS_RRS       (string)    set the parity count for reduced redundancy storage class e.g. "EC:2"
+MINIO_STORAGE_CLASS_COMMENT   (sentence)  optionally add a comment to this setting
+```
+
+### Cache
+MinIO provides caching storage tier for primarily gateway deployments, allowing you to cache content for faster reads, cost savings on repeated downloads from the cloud.
+
+```
+KEY:
+cache  add caching storage tier
+
+ARGS:
+drives*  (csv)       comma separated mountpoints e.g. "/optane1,/optane2"
+expiry   (number)    cache expiry duration in days e.g. "90"
+quota    (number)    limit cache drive usage in percentage e.g. "90"
+exclude  (csv)       comma separated wildcard exclusion patterns e.g. "bucket/*.tmp,*.exe"
+comment  (sentence)  optionally add a comment to this setting
+```
+
+or environment variables
+```
+KEY:
+cache  add caching storage tier
+
+ARGS:
+MINIO_CACHE_DRIVES*  (csv)       comma separated mountpoints e.g. "/optane1,/optane2"
+MINIO_CACHE_EXPIRY   (number)    cache expiry duration in days e.g. "90"
+MINIO_CACHE_QUOTA    (number)    limit cache drive usage in percentage e.g. "90"
+MINIO_CACHE_EXCLUDE  (csv)       comma separated wildcard exclusion patterns e.g. "bucket/*.tmp,*.exe"
+MINIO_CACHE_COMMENT  (sentence)  optionally add a comment to this setting
+```
+
+#### Etcd
+MinIO supports storing encrypted IAM assets and bucket DNS records on etcd.
+
+> NOTE: if *path_prefix* is set then MinIO will not federate your buckets, namespaced IAM assets are assumed as isolated tenants, only buckets are considered globally unique but performing a lookup with a *bucket* which belongs to a different tenant will fail unlike federated setups where MinIO would port-forward and route the request to relevant cluster accordingly. This is a special feature, federated deployments should not need to set *path_prefix*.
+
+```
+KEY:
+etcd  federate multiple clusters for IAM and Bucket DNS
+
+ARGS:
+endpoints*       (csv)       comma separated list of etcd endpoints e.g. "http://localhost:2379"
+path_prefix      (path)      namespace prefix to isolate tenants e.g. "customer1/"
+coredns_path     (path)      shared bucket DNS records, default is "/skydns"
+client_cert      (path)      client cert for mTLS authentication
+client_cert_key  (path)      client cert key for mTLS authentication
+comment          (sentence)  optionally add a comment to this setting
+```
+
+or environment variables
+```
+KEY:
+etcd  federate multiple clusters for IAM and Bucket DNS
+
+ARGS:
+MINIO_ETCD_ENDPOINTS*       (csv)       comma separated list of etcd endpoints e.g. "http://localhost:2379"
+MINIO_ETCD_PATH_PREFIX      (path)      namespace prefix to isolate tenants e.g. "customer1/"
+MINIO_ETCD_COREDNS_PATH     (path)      shared bucket DNS records, default is "/skydns"
+MINIO_ETCD_CLIENT_CERT      (path)      client cert for mTLS authentication
+MINIO_ETCD_CLIENT_CERT_KEY  (path)      client cert key for mTLS authentication
+MINIO_ETCD_COMMENT          (sentence)  optionally add a comment to this setting
+```
+
+#### Notifications
+Notification targets supported by MinIO are in the following list. To configure individual targets please refer to more detailed documentation [here](https://docs.min.io/docs/minio-bucket-notification-guide.html)
+
+```
+notify_webhook        publish bucket notifications to webhook endpoints
+notify_amqp           publish bucket notifications to AMQP endpoints
+notify_kafka          publish bucket notifications to Kafka endpoints
+notify_mqtt           publish bucket notifications to MQTT endpoints
+notify_nats           publish bucket notifications to NATS endpoints
+notify_nsq            publish bucket notifications to NSQ endpoints
+notify_mysql          publish bucket notifications to MySQL databases
+notify_postgres       publish bucket notifications to Postgres databases
+notify_elasticsearch  publish bucket notifications to Elasticsearch endpoints
+notify_redis          publish bucket notifications to Redis datastores
+```
+
+### Accessing configuration
+All configuration changes can be made using [`mc admin config` get/set/reset/export/import commands](https://github.com/minio/mc/blob/master/docs/minio-admin-complete-guide.md).
+
+#### List all config keys available
+```
+~ mc admin config set myminio/
+```
+
+#### Obtain help for each key
+```
+~ mc admin config set myminio/ <key>
+```
+
+e.g: `mc admin config set myminio/ etcd` returns available `etcd` config args
+
+```
+~ mc admin config set play/ etcd
+KEY:
+etcd  federate multiple clusters for IAM and Bucket DNS
+
+ARGS:
+endpoints*       (csv)       comma separated list of etcd endpoints e.g. "http://localhost:2379"
+path_prefix      (path)      namespace prefix to isolate tenants e.g. "customer1/"
+coredns_path     (path)      shared bucket DNS records, default is "/skydns"
+client_cert      (path)      client cert for mTLS authentication
+client_cert_key  (path)      client cert key for mTLS authentication
+comment          (sentence)  optionally add a comment to this setting
+```
+
+To get ENV equivalent for each config args use `--env` flag
+```
+~ mc admin config set play/ etcd --env
+KEY:
+etcd  federate multiple clusters for IAM and Bucket DNS
+
+ARGS:
+MINIO_ETCD_ENDPOINTS*       (csv)       comma separated list of etcd endpoints e.g. "http://localhost:2379"
+MINIO_ETCD_PATH_PREFIX      (path)      namespace prefix to isolate tenants e.g. "customer1/"
+MINIO_ETCD_COREDNS_PATH     (path)      shared bucket DNS records, default is "/skydns"
+MINIO_ETCD_CLIENT_CERT      (path)      client cert for mTLS authentication
+MINIO_ETCD_CLIENT_CERT_KEY  (path)      client cert key for mTLS authentication
+MINIO_ETCD_COMMENT          (sentence)  optionally add a comment to this setting
+```
+
+This behavior is consistent across all keys, each key self documents itself with valid examples.
+
+## Environment only settings (not in config)
+
+#### Worm
+Enable this to turn on Write-Once-Read-Many. By default it is set to `off`. Set ``MINIO_WORM=on`` environment variable to enable WORM mode.
 
 Example:
 
 ```sh
-export MINIO_WORM_STATE=on
+export MINIO_WORM=on
 minio server /data
 ```
-
-### Storage Class
-
-| Field                          | Type     | Description                                                                                                                                                                                  |
-|:-------------------------------|:---------|:---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| ``storageclass``               |          | Set storage class for configurable data and parity, as per object basis.                                                                                                                     |
-| ``storageclass standard=EC:4`` | _string_ | Value for standard storage class. It should be in the format `EC:Parity`, for example to set 4 disk parity for standard storage class objects, set this field to `EC:4`.                     |
-| ``storageclass rrs=EC:2``      | _string_ | Value for reduced redundancy storage class. It should be in the format `EC:Parity`, for example to set 3 disk parity for reduced redundancy storage class objects, set this field to `EC:3`. |
-
-By default, parity for objects with standard storage class is set to `N/2`, and parity for objects with reduced redundancy storage class objects is set to `2`. Read more about storage class support in MinIO server [here](https://github.com/minio/minio/blob/master/docs/erasure/storage-class/README.md).
-
-### Cache
-| Field                                                        | Type       | Description                                                                                                 |
-|:-------------------------------------------------------------|:-----------|:------------------------------------------------------------------------------------------------------------|
-| ``cache drives="/mnt/drive1;/mnt/drive2;/mnt/cache{1...3}"`` | _[]string_ | List of mounted file system drives with [`atime`](http://kerolasa.github.io/filetimes.html) support enabled |
-| ``cache exclude="*.pdf;mybucket/*"``                         | _[]string_ | List of wildcard patterns for prefixes to exclude from cache                                                |
-| ``cache expiry=90``                                          | _int_      | Days to cache expiry                                                                                        |
-| ``cache quota=70``                                           | _int_      | Percentage of disk available to cache                                                                       |
-|                                                              |            |                                                                                                             |
-
-#### Notify
-
-| Field                    | Type | Description                                                                                                                           |
-|:-------------------------|:-----|:--------------------------------------------------------------------------------------------------------------------------------------|
-| ``notify_amqp``          |      | [Configure to publish MinIO events via AMQP target.](https://docs.min.io/docs/minio-bucket-notification-guide#AMQP)                   |
-| ``notify_nats``          |      | [Configure to publish MinIO events via NATS target.](https://docs.min.io/docs/minio-bucket-notification-guide#NATS)                   |
-| ``notify_elasticsearch`` |      | [Configure to publish MinIO events via Elasticsearch target.](https://docs.min.io/docs/minio-bucket-notification-guide#Elasticsearch) |
-| ``notify_redis``         |      | [Configure to publish MinIO events via Redis target.](https://docs.min.io/docs/minio-bucket-notification-guide#Redis)                 |
-| ``notify_postgresql``    |      | [Configure to publish MinIO events via PostgreSQL target.](https://docs.min.io/docs/minio-bucket-notification-guide#PostgreSQL)       |
-| ``notify_kafka``         |      | [Configure to publish MinIO events via Apache Kafka target.](https://docs.min.io/docs/minio-bucket-notification-guide#apache-kafka)   |
-| ``notify_webhook``       |      | [Configure to publish MinIO events via Webhooks target.](https://docs.min.io/docs/minio-bucket-notification-guide#webhooks)           |
-| ``notify_mysql``         |      | [Configure to publish MinIO events via MySql target.](https://docs.min.io/docs/minio-bucket-notification-guide#MySQL)                 |
-| ``notify_mqtt``          |      | [Configure to publish MinIO events via MQTT target.](https://docs.min.io/docs/minio-bucket-notification-guide#MQTT)                   |
-
-### Accessing configuration file
-All configuration changes can be made using [`mc admin config` get/set commands](https://github.com/minio/mc/blob/master/docs/minio-admin-complete-guide.md). Following sections provide brief explanation of fields and how to customize them. A complete example of `config.json` is available [here](https://raw.githubusercontent.com/minio/minio/master/docs/config/config.sample.json)
-
-## Environment only settings
 
 ### Browser
 

@@ -23,17 +23,19 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/Azure/azure-sdk-for-go/storage"
+	"github.com/Azure/azure-storage-blob-go/azblob"
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 	"google.golang.org/api/googleapi"
 
 	minio "github.com/minio/minio-go/v6"
+	"github.com/minio/minio/cmd/config/etcd/dns"
 	"github.com/minio/minio/cmd/crypto"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
-	"github.com/minio/minio/pkg/dns"
 	"github.com/minio/minio/pkg/event"
 	"github.com/minio/minio/pkg/hash"
+	"github.com/minio/minio/pkg/objectlock"
+	"github.com/minio/minio/pkg/policy"
 )
 
 // APIError structure
@@ -141,7 +143,13 @@ const (
 	ErrInvalidPrefixMarker
 	ErrBadRequest
 	ErrKeyTooLongError
-	ErrInvalidAPIVersion
+	ErrInvalidBucketObjectLockConfiguration
+	ErrObjectLockConfigurationNotAllowed
+	ErrObjectLocked
+	ErrInvalidRetentionDate
+	ErrPastObjectLockRetainDate
+	ErrUnknownWORMModeDirective
+	ErrObjectLockInvalidHeaders
 	// Add new error codes here.
 
 	// SSE-S3 related API errors
@@ -721,7 +729,41 @@ var errorCodes = errorCodeMap{
 		Description:    "Duration provided in the request is invalid.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
-
+	ErrInvalidBucketObjectLockConfiguration: {
+		Code:           "InvalidRequest",
+		Description:    "Bucket is missing ObjectLockConfiguration",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrObjectLockConfigurationNotAllowed: {
+		Code:           "InvalidBucketState",
+		Description:    "Object Lock configuration cannot be enabled on existing buckets.",
+		HTTPStatusCode: http.StatusConflict,
+	},
+	ErrObjectLocked: {
+		Code:           "InvalidRequest",
+		Description:    "Object is WORM protected and cannot be overwritten",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrInvalidRetentionDate: {
+		Code:           "InvalidRequest",
+		Description:    "Date must be provided in ISO 8601 format",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrPastObjectLockRetainDate: {
+		Code:           "InvalidRequest",
+		Description:    "the retain until date must be in the future",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrUnknownWORMModeDirective: {
+		Code:           "InvalidRequest",
+		Description:    "unknown wormMode directive",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrObjectLockInvalidHeaders: {
+		Code:           "InvalidRequest",
+		Description:    "x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 	/// Bucket notification related errors.
 	ErrEventNotification: {
 		Code:           "InvalidArgument",
@@ -1503,11 +1545,6 @@ var errorCodes = errorCodeMap{
 		Description:    "Invalid according to Policy: Policy Condition failed",
 		HTTPStatusCode: http.StatusForbidden,
 	},
-	ErrInvalidAPIVersion: {
-		Code:           "ErrInvalidAPIVersion",
-		Description:    "Invalid version found in the request",
-		HTTPStatusCode: http.StatusNotFound,
-	},
 	// Add your error structure here.
 }
 
@@ -1575,6 +1612,16 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrOperationTimedOut
 	case errDiskNotFound:
 		apiErr = ErrSlowDown
+	case objectlock.ErrInvalidRetentionDate:
+		apiErr = ErrInvalidRetentionDate
+	case objectlock.ErrPastObjectLockRetainDate:
+		apiErr = ErrPastObjectLockRetainDate
+	case objectlock.ErrUnknownWORMModeDirective:
+		apiErr = ErrUnknownWORMModeDirective
+	case objectlock.ErrObjectLockInvalidHeaders:
+		apiErr = ErrObjectLockInvalidHeaders
+	case objectlock.ErrMalformedXML:
+		apiErr = ErrMalformedXML
 	}
 
 	// Compression errors
@@ -1689,8 +1736,6 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrUnsupportedNotification
 	case BackendDown:
 		apiErr = ErrBackendDown
-	case crypto.Error:
-		apiErr = ErrObjectTampered
 	case ObjectNameTooLong:
 		apiErr = ErrKeyTooLongError
 	default:
@@ -1735,9 +1780,15 @@ func toAPIError(ctx context.Context, err error) APIError {
 		// their internal error types. This code is only
 		// useful with gateway implementations.
 		switch e := err.(type) {
+		case policy.Error:
+			apiErr = APIError{
+				Code:           "MalformedPolicy",
+				Description:    e.Error(),
+				HTTPStatusCode: http.StatusBadRequest,
+			}
 		case crypto.Error:
 			apiErr = APIError{
-				Code:           "XKMSInternalError",
+				Code:           "XMinIOEncryptionError",
 				Description:    e.Error(),
 				HTTPStatusCode: http.StatusBadRequest,
 			}
@@ -1759,11 +1810,11 @@ func toAPIError(ctx context.Context, err error) APIError {
 				apiErr.Code = e.Errors[0].Reason
 
 			}
-		case storage.AzureStorageServiceError:
+		case azblob.StorageError:
 			apiErr = APIError{
-				Code:           e.Code,
-				Description:    e.Message,
-				HTTPStatusCode: e.StatusCode,
+				Code:           string(e.ServiceCode()),
+				Description:    e.Error(),
+				HTTPStatusCode: e.Response().StatusCode,
 			}
 		case oss.ServiceError:
 			apiErr = APIError{

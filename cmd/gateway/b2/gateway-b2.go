@@ -57,34 +57,18 @@ USAGE:
 FLAGS:
   {{range .VisibleFlags}}{{.}}
   {{end}}{{end}}
-ENVIRONMENT VARIABLES:
-  ACCESS:
-     MINIO_ACCESS_KEY: B2 account id.
-     MINIO_SECRET_KEY: B2 application key.
-
-  BROWSER:
-     MINIO_BROWSER: To disable web browser access, set this value to "off".
-
-  DOMAIN:
-     MINIO_DOMAIN: To enable virtual-host-style requests, set this value to MinIO host domain name.
-
-  CACHE:
-     MINIO_CACHE_DRIVES: List of mounted drives or directories delimited by ";".
-     MINIO_CACHE_EXCLUDE: List of cache exclusion patterns delimited by ";".
-     MINIO_CACHE_EXPIRY: Cache expiry duration in days.
-     MINIO_CACHE_QUOTA: Maximum permitted usage of the cache in percentage (0-100).
 
 EXAMPLES:
-  1. Start minio gateway server for B2 backend.
+  1. Start minio gateway server for B2 backend
      {{.Prompt}} {{.EnvVarSetCommand}} MINIO_ACCESS_KEY{{.AssignmentOperator}}accountID
      {{.Prompt}} {{.EnvVarSetCommand}} MINIO_SECRET_KEY{{.AssignmentOperator}}applicationKey
      {{.Prompt}} {{.HelpName}}
 
-  2. Start minio gateway server for B2 backend with edge caching enabled.
+  2. Start minio gateway server for B2 backend with edge caching enabled
      {{.Prompt}} {{.EnvVarSetCommand}} MINIO_ACCESS_KEY{{.AssignmentOperator}}accountID
      {{.Prompt}} {{.EnvVarSetCommand}} MINIO_SECRET_KEY{{.AssignmentOperator}}applicationKey
-     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_DRIVES{{.AssignmentOperator}}"/mnt/drive1;/mnt/drive2;/mnt/drive3;/mnt/drive4"
-     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_EXCLUDE{{.AssignmentOperator}}"bucket1/*;*.png"
+     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_DRIVES{{.AssignmentOperator}}"/mnt/drive1,/mnt/drive2,/mnt/drive3,/mnt/drive4"
+     {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_EXCLUDE{{.AssignmentOperator}}"bucket1/*,*.png"
      {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_EXPIRY{{.AssignmentOperator}}40
      {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_QUOTA{{.AssignmentOperator}}80
      {{.Prompt}} {{.HelpName}}
@@ -123,7 +107,10 @@ func (g *B2) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error) 
 	return &b2Objects{
 		creds:    creds,
 		b2Client: client,
-		ctx:      ctx,
+		httpClient: &http.Client{
+			Transport: minio.NewCustomHTTPTransport(),
+		},
+		ctx: ctx,
 	}, nil
 }
 
@@ -135,10 +122,11 @@ func (g *B2) Production() bool {
 // b2Object implements gateway for MinIO and BackBlaze B2 compatible object storage servers.
 type b2Objects struct {
 	minio.GatewayUnsupported
-	mu       sync.Mutex
-	creds    auth.Credentials
-	b2Client *b2.B2
-	ctx      context.Context
+	mu         sync.Mutex
+	creds      auth.Credentials
+	b2Client   *b2.B2
+	httpClient *http.Client
+	ctx        context.Context
 }
 
 // Convert B2 errors to minio object layer errors.
@@ -225,12 +213,13 @@ func b2MsgCodeToObjectError(code int, msgCode string, msg string, params ...stri
 // Shutdown saves any gateway metadata to disk
 // if necessary and reload upon next restart.
 func (l *b2Objects) Shutdown(ctx context.Context) error {
-	// TODO
 	return nil
 }
 
 // StorageInfo is not relevant to B2 backend.
 func (l *b2Objects) StorageInfo(ctx context.Context) (si minio.StorageInfo) {
+	si.Backend.Type = minio.BackendGateway
+	si.Backend.GatewayOnline = minio.IsBackendOnline(ctx, l.httpClient, "https://api.backblazeb2.com/b2api/v1")
 	return si
 }
 
@@ -872,4 +861,9 @@ func (l *b2Objects) DeleteBucketPolicy(ctx context.Context, bucket string) error
 // IsCompressionSupported returns whether compression is applicable for this layer.
 func (l *b2Objects) IsCompressionSupported() bool {
 	return false
+}
+
+// IsReady returns whether the layer is ready to take requests.
+func (l *b2Objects) IsReady(ctx context.Context) bool {
+	return minio.IsBackendOnline(ctx, l.httpClient, "https://api.backblazeb2.com/b2api/v1")
 }

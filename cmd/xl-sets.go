@@ -28,7 +28,9 @@ import (
 
 	"github.com/minio/minio/cmd/config/storageclass"
 	xhttp "github.com/minio/minio/cmd/http"
+	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/bpool"
+	"github.com/minio/minio/pkg/dsync"
 	"github.com/minio/minio/pkg/lifecycle"
 	"github.com/minio/minio/pkg/madmin"
 	"github.com/minio/minio/pkg/policy"
@@ -37,6 +39,9 @@ import (
 
 // setsStorageAPI is encapsulated type for Close()
 type setsStorageAPI [][]StorageAPI
+
+// setsDsyncLockers is encapsulated type for Close()
+type setsDsyncLockers [][]dsync.NetLocker
 
 func (s setsStorageAPI) Close() error {
 	for i := 0; i < len(s); i++ {
@@ -49,6 +54,11 @@ func (s setsStorageAPI) Close() error {
 		}
 	}
 	return nil
+}
+
+// Information of a new disk connection
+type diskConnectInfo struct {
+	setIndex int
 }
 
 // xlSets implements ObjectLayer combining a static list of erasure coded
@@ -66,11 +76,16 @@ type xlSets struct {
 	// Re-ordered list of disks per set.
 	xlDisks setsStorageAPI
 
+	// Distributed locker clients.
+	xlLockers setsDsyncLockers
+
 	// List of endpoints provided on the command line.
-	endpoints EndpointList
+	endpoints Endpoints
 
 	// Total number of sets and the number of disks per set.
 	setCount, drivesPerSet int
+
+	disksConnectEvent chan diskConnectInfo
 
 	// Done channel to control monitoring loop.
 	disksConnectDoneCh chan struct{}
@@ -80,6 +95,9 @@ type xlSets struct {
 
 	// Merge tree walk
 	pool *MergeWalkPool
+
+	mrfMU      sync.Mutex
+	mrfUploads map[string]int
 }
 
 // isConnected - checks if the endpoint is connected or not.
@@ -127,6 +145,8 @@ func connectEndpoint(endpoint Endpoint) (StorageAPI, *formatXLV3, error) {
 
 // findDiskIndex - returns the i,j'th position of the input `format` against the reference
 // format, after successful validation.
+//   - i'th position is the set index
+//   - j'th position is the disk index in the current set
 func findDiskIndex(refFormat, format *formatXLV3) (int, int, error) {
 	if err := formatXLV3Check(refFormat, format); err != nil {
 		return 0, 0, err
@@ -148,8 +168,7 @@ func findDiskIndex(refFormat, format *formatXLV3) (int, int, error) {
 }
 
 // connectDisksWithQuorum is same as connectDisks but waits
-// for quorum number of formatted disks to be online in
-// any given sets.
+// for quorum number of formatted disks to be online in any given sets.
 func (s *xlSets) connectDisksWithQuorum() {
 	var onlineDisks int
 	for onlineDisks < len(s.endpoints)/2 {
@@ -191,7 +210,7 @@ func (s *xlSets) connectDisks() {
 			printEndpointError(endpoint, err)
 			continue
 		}
-		i, j, err := findDiskIndex(s.format, format)
+		setIndex, diskIndex, err := findDiskIndex(s.format, format)
 		if err != nil {
 			// Close the internal connection to avoid connection leaks.
 			disk.Close()
@@ -200,8 +219,14 @@ func (s *xlSets) connectDisks() {
 		}
 		disk.SetDiskID(format.XL.This)
 		s.xlDisksMu.Lock()
-		s.xlDisks[i][j] = disk
+		s.xlDisks[setIndex][diskIndex] = disk
 		s.xlDisksMu.Unlock()
+
+		// Send a new disk connect event with a timeout
+		select {
+		case s.disksConnectEvent <- diskConnectInfo{setIndex: setIndex}:
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 }
 
@@ -209,6 +234,7 @@ func (s *xlSets) connectDisks() {
 // endpoints by reconnecting them and making sure to place them into right position in
 // the set topology, this monitoring happens at a given monitoring interval.
 func (s *xlSets) monitorAndConnectEndpoints(monitorInterval time.Duration) {
+
 	ticker := time.NewTicker(monitorInterval)
 	// Stop the timer.
 	defer ticker.Stop()
@@ -222,6 +248,14 @@ func (s *xlSets) monitorAndConnectEndpoints(monitorInterval time.Duration) {
 		case <-ticker.C:
 			s.connectDisks()
 		}
+	}
+}
+
+func (s *xlSets) GetLockers(setIndex int) func() []dsync.NetLocker {
+	return func() []dsync.NetLocker {
+		lockers := make([]dsync.NetLocker, s.drivesPerSet)
+		copy(lockers, s.xlLockers[setIndex])
+		return lockers
 	}
 }
 
@@ -239,19 +273,21 @@ func (s *xlSets) GetDisks(setIndex int) func() []StorageAPI {
 const defaultMonitorConnectEndpointInterval = time.Second * 10 // Set to 10 secs.
 
 // Initialize new set of erasure coded sets.
-func newXLSets(endpoints EndpointList, format *formatXLV3, setCount int, drivesPerSet int) (ObjectLayer, error) {
-
+func newXLSets(endpoints Endpoints, format *formatXLV3, setCount int, drivesPerSet int) (*xlSets, error) {
 	// Initialize the XL sets instance.
 	s := &xlSets{
 		sets:               make([]*xlObjects, setCount),
 		xlDisks:            make([][]StorageAPI, setCount),
+		xlLockers:          make([][]dsync.NetLocker, setCount),
 		endpoints:          endpoints,
 		setCount:           setCount,
 		drivesPerSet:       drivesPerSet,
 		format:             format,
+		disksConnectEvent:  make(chan diskConnectInfo),
 		disksConnectDoneCh: make(chan struct{}),
 		distributionAlgo:   format.XL.DistributionAlgo,
 		pool:               NewMergeWalkPool(globalMergeLookupTimeout),
+		mrfUploads:         make(map[string]int),
 	}
 
 	mutex := newNSLock(globalIsDistXL)
@@ -262,14 +298,26 @@ func newXLSets(endpoints EndpointList, format *formatXLV3, setCount int, drivesP
 
 	for i := 0; i < len(format.XL.Sets); i++ {
 		s.xlDisks[i] = make([]StorageAPI, drivesPerSet)
+		s.xlLockers[i] = make([]dsync.NetLocker, drivesPerSet)
 
 		// Initialize xl objects for a given set.
 		s.sets[i] = &xlObjects{
-			getDisks: s.GetDisks(i),
-			nsMutex:  mutex,
-			bp:       bp,
+			getDisks:    s.GetDisks(i),
+			getLockers:  s.GetLockers(i),
+			nsMutex:     mutex,
+			bp:          bp,
+			mrfUploadCh: make(chan partialUpload, 10000),
 		}
-		go s.sets[i].cleanupStaleMultipartUploads(context.Background(), GlobalMultipartCleanupInterval, GlobalMultipartExpiry, GlobalServiceDoneCh)
+
+		go s.sets[i].cleanupStaleMultipartUploads(context.Background(),
+			GlobalMultipartCleanupInterval, GlobalMultipartExpiry, GlobalServiceDoneCh)
+	}
+
+	// Rely on endpoints list to initialize, init lockers.
+	for i := 0; i < s.setCount; i++ {
+		for j := 0; j < s.drivesPerSet; j++ {
+			s.xlLockers[i][j] = newLockAPI(s.endpoints[i*s.drivesPerSet+j])
+		}
 	}
 
 	// Connect disks right away, but wait until we have `format.json` quorum.
@@ -278,7 +326,15 @@ func newXLSets(endpoints EndpointList, format *formatXLV3, setCount int, drivesP
 	// Start the disk monitoring and connect routine.
 	go s.monitorAndConnectEndpoints(defaultMonitorConnectEndpointInterval)
 
+	go s.maintainMRFList()
+	go s.healMRFRoutine()
+
 	return s, nil
+}
+
+// NewNSLock - initialize a new namespace RWLocker instance.
+func (s *xlSets) NewNSLock(ctx context.Context, bucket string, object string) RWLocker {
+	return s.getHashedSet(object).NewNSLock(ctx, bucket, object)
 }
 
 // StorageInfo - combines output of StorageInfo across all erasure coded object sets.
@@ -341,20 +397,17 @@ func (s *xlSets) StorageInfo(ctx context.Context) StorageInfo {
 
 	errs := combineStorageErrors(dErrs, sErrs)
 	drivesInfo := formatsToDrivesInfo(s.endpoints, formats, errs)
-	refFormat, err := getFormatXLInQuorum(formats)
-	if err != nil {
-		// Ignore errors here, since this call cannot do anything at
-		// this point. too many disks are down already.
-		return storageInfo
-	}
 
 	// fill all the available/online endpoints
-	for _, drive := range drivesInfo {
+	for k, drive := range drivesInfo {
 		if drive.UUID == "" {
 			continue
 		}
-		for i := range refFormat.XL.Sets {
-			for j, driveUUID := range refFormat.XL.Sets[i] {
+		if formats[k] == nil {
+			continue
+		}
+		for i := range formats[k].XL.Sets {
+			for j, driveUUID := range formats[k].XL.Sets[i] {
 				if driveUUID == drive.UUID {
 					storageInfo.Backend.Sets[i][j] = drive
 				}
@@ -484,7 +537,7 @@ func (s *xlSets) getHashedSet(input string) (set *xlObjects) {
 
 // GetBucketInfo - returns bucket info from one of the erasure coded set.
 func (s *xlSets) GetBucketInfo(ctx context.Context, bucket string) (bucketInfo BucketInfo, err error) {
-	return s.getHashedSet(bucket).GetBucketInfo(ctx, bucket)
+	return s.getHashedSet("").GetBucketInfo(ctx, bucket)
 }
 
 // ListObjectsV2 lists all objects in bucket filtered by prefix
@@ -650,7 +703,6 @@ func (s *xlSets) DeleteObject(ctx context.Context, bucket string, object string)
 // objects are group by set first, and then bulk delete is invoked
 // for each set, the error response of each delete will be returned
 func (s *xlSets) DeleteObjects(ctx context.Context, bucket string, objects []string) ([]error, error) {
-
 	type delObj struct {
 		// Set index associated to this object
 		setIndex int
@@ -708,13 +760,6 @@ func (s *xlSets) CopyObject(ctx context.Context, srcBucket, srcObject, destBucke
 		return srcSet.CopyObject(ctx, srcBucket, srcObject, destBucket, destObject, srcInfo, srcOpts, dstOpts)
 	}
 
-	if !cpSrcDstSame {
-		objectDWLock := destSet.nsMutex.NewNSLock(ctx, destBucket, destObject)
-		if err := objectDWLock.GetLock(globalObjectTimeout); err != nil {
-			return objInfo, err
-		}
-		defer objectDWLock.Unlock()
-	}
 	putOpts := ObjectOptions{ServerSideEncryption: dstOpts.ServerSideEncryption, UserDefined: srcInfo.UserDefined}
 	return destSet.putObject(ctx, destBucket, destObject, srcInfo.PutObjReader, putOpts)
 }
@@ -999,11 +1044,6 @@ func (s *xlSets) listObjectsNonSlash(ctx context.Context, bucket, prefix, marker
 // walked and merged at this layer. Resulting value through the merge process sends
 // the data in lexically sorted order.
 func (s *xlSets) listObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int, heal bool) (loi ListObjectsInfo, err error) {
-	if delimiter != SlashSeparator && delimiter != "" {
-		// "heal" option passed can be ignored as the heal-listing does not send non-standard delimiter.
-		return s.listObjectsNonSlash(ctx, bucket, prefix, marker, delimiter, maxKeys)
-	}
-
 	if err = checkListObjsArgs(ctx, bucket, prefix, marker, delimiter, s); err != nil {
 		return loi, err
 	}
@@ -1011,7 +1051,7 @@ func (s *xlSets) listObjects(ctx context.Context, bucket, prefix, marker, delimi
 	// Marker is set validate pre-condition.
 	if marker != "" {
 		// Marker not common with prefix is not implemented. Send an empty response
-		if !hasPrefix(marker, prefix) {
+		if !HasPrefix(marker, prefix) {
 			return loi, nil
 		}
 	}
@@ -1033,6 +1073,11 @@ func (s *xlSets) listObjects(ctx context.Context, bucket, prefix, marker, delimi
 	// Over flowing count - reset to maxObjectList.
 	if maxKeys < 0 || maxKeys > maxObjectList {
 		maxKeys = maxObjectList
+	}
+
+	if delimiter != SlashSeparator && delimiter != "" {
+		// "heal" option passed can be ignored as the heal-listing does not send non-standard delimiter.
+		return s.listObjectsNonSlash(ctx, bucket, prefix, marker, delimiter, maxKeys)
 	}
 
 	// Default is recursive, if delimiter is set then list non recursive.
@@ -1059,7 +1104,7 @@ func (s *xlSets) listObjects(ctx context.Context, bucket, prefix, marker, delimi
 
 	for _, entry := range entries.Files {
 		var objInfo ObjectInfo
-		if hasSuffix(entry.Name, SlashSeparator) {
+		if HasSuffix(entry.Name, SlashSeparator) {
 			if !recursive {
 				loi.Prefixes = append(loi.Prefixes, entry.Name)
 				continue
@@ -1205,7 +1250,7 @@ else
 fi
 */
 
-func formatsToDrivesInfo(endpoints EndpointList, formats []*formatXLV3, sErrs []error) (beforeDrives []madmin.DriveInfo) {
+func formatsToDrivesInfo(endpoints Endpoints, formats []*formatXLV3, sErrs []error) (beforeDrives []madmin.DriveInfo) {
 	beforeDrives = make([]madmin.DriveInfo, len(endpoints))
 	// Existing formats are available (i.e. ok), so save it in
 	// result, also populate disks to be healed.
@@ -1238,13 +1283,6 @@ func formatsToDrivesInfo(endpoints EndpointList, formats []*formatXLV3, sErrs []
 // Reloads the format from the disk, usually called by a remote peer notifier while
 // healing in a distributed setup.
 func (s *xlSets) ReloadFormat(ctx context.Context, dryRun bool) (err error) {
-	// Acquire lock on format.json
-	formatLock := s.getHashedSet(formatConfigFile).nsMutex.NewNSLock(ctx, minioMetaBucket, formatConfigFile)
-	if err = formatLock.GetRLock(globalHealingTimeout); err != nil {
-		return err
-	}
-	defer formatLock.RUnlock()
-
 	storageDisks, errs := initStorageDisksWithErrors(s.endpoints)
 	for i, err := range errs {
 		if err != nil && err != errDiskNotFound {
@@ -1267,7 +1305,7 @@ func (s *xlSets) ReloadFormat(ctx context.Context, dryRun bool) (err error) {
 			// Look for acceptable heal errors, for any other
 			// errors we should simply quit and return.
 			if _, ok := formatHealErrors[sErr]; !ok {
-				return fmt.Errorf("Disk %s: %s", s.endpoints[index], sErr)
+				return fmt.Errorf("Disk %s: %w", s.endpoints[index], sErr)
 			}
 		}
 	}
@@ -1286,7 +1324,9 @@ func (s *xlSets) ReloadFormat(ctx context.Context, dryRun bool) (err error) {
 	s.format = refFormat
 
 	// Close all existing disks and reconnect all the disks.
+	s.xlDisksMu.Lock()
 	s.xlDisks.Close()
+	s.xlDisksMu.Unlock()
 	s.connectDisks()
 
 	// Restart monitoring loop to monitor reformatted disks again.
@@ -1352,16 +1392,7 @@ func markRootDisksAsDown(storageDisks []StorageAPI) {
 }
 
 // HealFormat - heals missing `format.json` on fresh unformatted disks.
-// TODO: In future support corrupted disks missing format.json but has erasure
-// coded data in it.
 func (s *xlSets) HealFormat(ctx context.Context, dryRun bool) (res madmin.HealResultItem, err error) {
-	// Acquire lock on format.json
-	formatLock := s.getHashedSet(formatConfigFile).nsMutex.NewNSLock(ctx, minioMetaBucket, formatConfigFile)
-	if err = formatLock.GetLock(globalHealingTimeout); err != nil {
-		return madmin.HealResultItem{}, err
-	}
-	defer formatLock.Unlock()
-
 	storageDisks, errs := initStorageDisksWithErrors(s.endpoints)
 	for i, derr := range errs {
 		if derr != nil && derr != errDiskNotFound {
@@ -1406,7 +1437,7 @@ func (s *xlSets) HealFormat(ctx context.Context, dryRun bool) (res madmin.HealRe
 			// Look for acceptable heal errors, for any other
 			// errors we should simply quit and return.
 			if _, ok := formatHealErrors[sErr]; !ok {
-				return res, fmt.Errorf("Disk %s: %s", s.endpoints[index], sErr)
+				return res, fmt.Errorf("Disk %s: %w", s.endpoints[index], sErr)
 			}
 		}
 	}
@@ -1415,11 +1446,6 @@ func (s *xlSets) HealFormat(ctx context.Context, dryRun bool) (res madmin.HealRe
 		// No unformatted disks found disks are either offline
 		// or online, no healing is required.
 		return res, errNoHealRequired
-	}
-
-	// All disks are unformatted, return quorum error.
-	if shouldInitXLDisks(sErrs) {
-		return res, errXLReadQuorum
 	}
 
 	refFormat, err := getFormatXLInQuorum(formats)
@@ -1473,12 +1499,6 @@ func (s *xlSets) HealFormat(ctx context.Context, dryRun bool) (res madmin.HealRe
 			}
 		}
 
-		// Initialize meta volume, if volume already exists ignores it, all disks which
-		// are not found are ignored as well.
-		if err = initFormatXLMetaVolume(storageDisks, tmpNewFormats); err != nil {
-			return madmin.HealResultItem{}, fmt.Errorf("Unable to initialize '.minio.sys' meta volume, %s", err)
-		}
-
 		// Save formats `format.json` across all disks.
 		if err = saveFormatXLAll(ctx, storageDisks, tmpNewFormats); err != nil {
 			return madmin.HealResultItem{}, err
@@ -1492,8 +1512,10 @@ func (s *xlSets) HealFormat(ctx context.Context, dryRun bool) (res madmin.HealRe
 		// Replace with new reference format.
 		s.format = refFormat
 
-		// Disconnect/relinquish all existing disks and reconnect the disks.
+		// Disconnect/relinquish all existing disks, lockers and reconnect the disks, lockers.
+		s.xlDisksMu.Lock()
 		s.xlDisks.Close()
+		s.xlDisksMu.Unlock()
 		s.connectDisks()
 
 		// Restart our monitoring loop to start monitoring newly formatted disks.
@@ -1505,12 +1527,6 @@ func (s *xlSets) HealFormat(ctx context.Context, dryRun bool) (res madmin.HealRe
 
 // HealBucket - heals inconsistent buckets and bucket metadata on all sets.
 func (s *xlSets) HealBucket(ctx context.Context, bucket string, dryRun, remove bool) (result madmin.HealResultItem, err error) {
-	bucketLock := globalNSMutex.NewNSLock(ctx, bucket, "")
-	if err := bucketLock.GetLock(globalHealingTimeout); err != nil {
-		return result, err
-	}
-	defer bucketLock.Unlock()
-
 	// Initialize heal result info
 	result = madmin.HealResultItem{
 		Type:      madmin.HealItemBucket,
@@ -1609,11 +1625,11 @@ func (s *xlSets) HealObjects(ctx context.Context, bucket, prefix string, healObj
 
 	marker := ""
 	for {
-		if globalHTTPServer != nil {
+		if httpServer := newHTTPServerFn(); httpServer != nil {
 			// Wait at max 10 minute for an inprogress request before proceeding to heal
 			waitCount := 600
 			// Any requests in progress, delay the heal.
-			for (globalHTTPServer.GetRequestCount() >= int32(globalXLSetCount*globalXLSetDriveCount)) &&
+			for (httpServer.GetRequestCount() >= int32(s.setCount*s.drivesPerSet)) &&
 				waitCount > 0 {
 				waitCount--
 				time.Sleep(1 * time.Second)
@@ -1643,4 +1659,103 @@ func (s *xlSets) HealObjects(ctx context.Context, bucket, prefix string, healObj
 
 func (s *xlSets) ListObjectsHeal(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (loi ListObjectsInfo, err error) {
 	return s.listObjects(ctx, bucket, prefix, marker, delimiter, maxKeys, true)
+}
+
+// GetMetrics - no op
+func (s *xlSets) GetMetrics(ctx context.Context) (*Metrics, error) {
+	logger.LogIf(ctx, NotImplemented{})
+	return &Metrics{}, NotImplemented{}
+}
+
+// IsReady - Returns true if atleast n/2 disks (read quorum) are online
+func (s *xlSets) IsReady(_ context.Context) bool {
+	s.xlDisksMu.RLock()
+	defer s.xlDisksMu.RUnlock()
+
+	var activeDisks int
+	for i := 0; i < s.setCount; i++ {
+		for j := 0; j < s.drivesPerSet; j++ {
+			if s.xlDisks[i][j] == nil {
+				continue
+			}
+			if s.xlDisks[i][j].IsOnline() {
+				activeDisks++
+			}
+			// Return true if read quorum is available.
+			if activeDisks >= len(s.endpoints)/2 {
+				return true
+			}
+		}
+	}
+	// Disks are not ready
+	return false
+}
+
+// maintainMRFList gathers the list of successful partial uploads
+// from all underlying xl sets and puts them in a global map which
+// should not have more than 10000 entries.
+func (s *xlSets) maintainMRFList() {
+	var agg = make(chan partialUpload, 10000)
+	for i, xl := range s.sets {
+		go func(c <-chan partialUpload, setIndex int) {
+			for msg := range c {
+				msg.failedSet = setIndex
+				select {
+				case agg <- msg:
+				default:
+				}
+			}
+		}(xl.mrfUploadCh, i)
+	}
+
+	for fUpload := range agg {
+		s.mrfMU.Lock()
+		if len(s.mrfUploads) > 10000 {
+			s.mrfMU.Unlock()
+			continue
+		}
+		s.mrfUploads[pathJoin(fUpload.bucket, fUpload.object)] = fUpload.failedSet
+		s.mrfMU.Unlock()
+	}
+}
+
+// healMRFRoutine monitors new disks connection, sweep the MRF list
+// to find objects related to the new disk that needs to be healed.
+func (s *xlSets) healMRFRoutine() {
+	// Wait until background heal state is initialized
+	var bgSeq *healSequence
+	for {
+		var ok bool
+		bgSeq, ok = globalBackgroundHealState.getHealSequenceByToken(bgHealingUUID)
+		if ok {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+
+	for e := range s.disksConnectEvent {
+		// Get the list of objects related the xl set
+		// to which the connected disk belongs.
+		var mrfUploads []string
+		s.mrfMU.Lock()
+		for k, v := range s.mrfUploads {
+			if v == e.setIndex {
+				mrfUploads = append(mrfUploads, k)
+			}
+		}
+		s.mrfMU.Unlock()
+
+		// Heal objects
+		for _, u := range mrfUploads {
+			// Send an object to be healed with a timeout
+			select {
+			case bgSeq.sourceCh <- u:
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			s.mrfMU.Lock()
+			delete(s.mrfUploads, u)
+			s.mrfMU.Unlock()
+		}
+	}
 }

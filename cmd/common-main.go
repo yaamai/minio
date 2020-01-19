@@ -29,6 +29,7 @@ import (
 	"github.com/minio/minio-go/v6/pkg/set"
 	"github.com/minio/minio/cmd/config"
 	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/auth"
 	"github.com/minio/minio/pkg/certs"
 	"github.com/minio/minio/pkg/env"
 )
@@ -157,13 +158,14 @@ func handleCommonCmdArgs(ctx *cli.Context) {
 
 func handleCommonEnvVars() {
 	var err error
-	globalBrowserEnabled, err = config.ParseBool(env.Get(config.EnvBrowser, config.StateOn))
+	globalBrowserEnabled, err = config.ParseBool(env.Get(config.EnvBrowser, config.EnableOn))
 	if err != nil {
 		logger.Fatal(config.ErrInvalidBrowserValue(err), "Invalid MINIO_BROWSER value in environment variable")
 	}
 
-	for _, domainName := range strings.Split(env.Get(config.EnvDomain, ""), config.ValueSeparator) {
-		if domainName != "" {
+	domains := env.Get(config.EnvDomain, "")
+	if len(domains) != 0 {
+		for _, domainName := range strings.Split(domains, config.ValueSeparator) {
 			if _, ok := dns2.IsDomainName(domainName); !ok {
 				logger.Fatal(config.ErrInvalidDomainValue(nil).Msg("Unknown value `%s`", domainName),
 					"Invalid MINIO_DOMAIN value in environment variable")
@@ -172,9 +174,9 @@ func handleCommonEnvVars() {
 		}
 	}
 
-	minioEndpointsEnv, ok := env.Lookup(config.EnvPublicIPs)
-	if ok {
-		minioEndpoints := strings.Split(minioEndpointsEnv, config.ValueSeparator)
+	publicIPs := env.Get(config.EnvPublicIPs, "")
+	if len(publicIPs) != 0 {
+		minioEndpoints := strings.Split(publicIPs, config.ValueSeparator)
 		var domainIPs = set.NewStringSet()
 		for _, endpoint := range minioEndpoints {
 			if net.ParseIP(endpoint) == nil {
@@ -186,7 +188,6 @@ func handleCommonEnvVars() {
 				for _, addr := range addrs {
 					domainIPs.Add(addr)
 				}
-				continue
 			}
 			domainIPs.Add(endpoint)
 		}
@@ -194,13 +195,28 @@ func handleCommonEnvVars() {
 	} else {
 		// Add found interfaces IP address to global domain IPS,
 		// loopback addresses will be naturally dropped.
-		updateDomainIPs(localIP4)
+		updateDomainIPs(mustGetLocalIP4())
 	}
 
 	// In place update is true by default if the MINIO_UPDATE is not set
 	// or is not set to 'off', if MINIO_UPDATE is set to 'off' then
 	// in-place update is off.
-	globalInplaceUpdateDisabled = strings.EqualFold(env.Get(config.EnvUpdate, config.StateOn), config.StateOff)
+	globalInplaceUpdateDisabled = strings.EqualFold(env.Get(config.EnvUpdate, config.EnableOn), config.EnableOff)
+
+	if env.IsSet(config.EnvAccessKey) || env.IsSet(config.EnvSecretKey) {
+		cred, err := auth.CreateCredentials(env.Get(config.EnvAccessKey, ""), env.Get(config.EnvSecretKey, ""))
+		if err != nil {
+			logger.Fatal(config.ErrInvalidCredentials(err),
+				"Unable to validate credentials inherited from the shell environment")
+		}
+		globalActiveCred = cred
+		globalConfigEncrypted = true
+	}
+
+	globalWORMEnabled, err = config.LookupWorm()
+	if err != nil {
+		logger.Fatal(config.ErrInvalidWormValue(err), "Invalid worm configuration")
+	}
 }
 
 func logStartupMessage(msg string) {

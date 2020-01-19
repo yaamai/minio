@@ -16,17 +16,20 @@ package crypto
 
 import (
 	"errors"
-	"fmt"
+	"net/http"
+	"reflect"
 	"strconv"
 
 	"github.com/minio/minio/cmd/config"
 	"github.com/minio/minio/pkg/env"
+	xnet "github.com/minio/minio/pkg/net"
 )
 
 // KMSConfig has the KMS config for hashicorp vault
 type KMSConfig struct {
 	AutoEncryption bool        `json:"-"`
 	Vault          VaultConfig `json:"vault"`
+	Kes            KesConfig   `json:"kes"`
 }
 
 // KMS Vault constants.
@@ -41,19 +44,73 @@ const (
 	KMSVaultAppRoleSecret = "auth_approle_secret"
 )
 
+// KMS kes constants.
+const (
+	KMSKesEndpoint = "endpoint"
+	KMSKesKeyFile  = "key_file"
+	KMSKesCertFile = "cert_file"
+	KMSKesCAPath   = "capath"
+	KMSKesKeyName  = "key_name"
+)
+
 // DefaultKVS - default KV crypto config
 var (
-	DefaultKVS = config.KVS{
-		config.State:          config.StateOff,
-		config.Comment:        "This is a default Vault configuration",
-		KMSVaultEndpoint:      "",
-		KMSVaultCAPath:        "",
-		KMSVaultKeyName:       "",
-		KMSVaultKeyVersion:    "",
-		KMSVaultNamespace:     "",
-		KMSVaultAuthType:      "approle",
-		KMSVaultAppRoleID:     "",
-		KMSVaultAppRoleSecret: "",
+	DefaultVaultKVS = config.KVS{
+		config.KV{
+			Key:   KMSVaultEndpoint,
+			Value: "",
+		},
+		config.KV{
+			Key:   KMSVaultKeyName,
+			Value: "",
+		},
+		config.KV{
+			Key:   KMSVaultAuthType,
+			Value: "approle",
+		},
+		config.KV{
+			Key:   KMSVaultAppRoleID,
+			Value: "",
+		},
+		config.KV{
+			Key:   KMSVaultAppRoleSecret,
+			Value: "",
+		},
+		config.KV{
+			Key:   KMSVaultCAPath,
+			Value: "",
+		},
+		config.KV{
+			Key:   KMSVaultKeyVersion,
+			Value: "",
+		},
+		config.KV{
+			Key:   KMSVaultNamespace,
+			Value: "",
+		},
+	}
+
+	DefaultKesKVS = config.KVS{
+		config.KV{
+			Key:   KMSKesEndpoint,
+			Value: "",
+		},
+		config.KV{
+			Key:   KMSKesKeyName,
+			Value: "",
+		},
+		config.KV{
+			Key:   KMSKesCertFile,
+			Value: "",
+		},
+		config.KV{
+			Key:   KMSKesKeyFile,
+			Value: "",
+		},
+		config.KV{
+			Key:   KMSKesCAPath,
+			Value: "",
+		},
 	}
 )
 
@@ -72,9 +129,6 @@ const (
 )
 
 const (
-	// EnvKMSVaultState to enable on/off
-	EnvKMSVaultState = "MINIO_KMS_VAULT_STATE"
-
 	// EnvKMSVaultEndpoint is the environment variable used to specify
 	// the vault HTTPS endpoint.
 	EnvKMSVaultEndpoint = "MINIO_KMS_VAULT_ENDPOINT"
@@ -111,7 +165,126 @@ const (
 	EnvKMSVaultNamespace = "MINIO_KMS_VAULT_NAMESPACE"
 )
 
-// LookupConfig extracts the KMS configuration provided by environment
+const (
+	// EnvKMSKesEndpoint is the environment variable used to specify
+	// the kes server HTTPS endpoint.
+	EnvKMSKesEndpoint = "MINIO_KMS_KES_ENDPOINT"
+
+	// EnvKMSKesKeyFile is the environment variable used to specify
+	// the TLS private key used by MinIO to authenticate to the kes
+	// server HTTPS via mTLS.
+	EnvKMSKesKeyFile = "MINIO_KMS_KES_KEY_FILE"
+
+	// EnvKMSKesCertFile is the environment variable used to specify
+	// the TLS certificate used by MinIO to authenticate to the kes
+	// server HTTPS via mTLS.
+	EnvKMSKesCertFile = "MINIO_KMS_KES_CERT_FILE"
+
+	// EnvKMSKesCAPath is the environment variable used to specify
+	// the TLS root certificates used by MinIO to verify the certificate
+	// presented by to the kes server when establishing a TLS connection.
+	EnvKMSKesCAPath = "MINIO_KMS_KES_CA_PATH"
+
+	// EnvKMSKesKeyName is the environment variable used to specify
+	// the (default) key at the kes server. In the S3 context it's
+	// referred as customer master key ID (CMK-ID).
+	EnvKMSKesKeyName = "MINIO_KMS_KES_KEY_NAME"
+)
+
+var defaultVaultCfg = VaultConfig{
+	Auth: VaultAuth{
+		Type: "approle",
+	},
+}
+
+var defaultKesCfg = KesConfig{}
+
+// EnabledVault returns true if HashiCorp Vault is enabled.
+func EnabledVault(kvs config.KVS) bool {
+	endpoint := kvs.Get(KMSVaultEndpoint)
+	return endpoint != ""
+}
+
+// EnabledKes returns true if kes as KMS is enabled.
+func EnabledKes(kvs config.KVS) bool {
+	endpoint := kvs.Get(KMSKesEndpoint)
+	return endpoint != ""
+}
+
+// LookupKesConfig lookup kes server configuration.
+func LookupKesConfig(kvs config.KVS) (KesConfig, error) {
+	kesCfg := KesConfig{}
+
+	endpointStr := env.Get(EnvKMSKesEndpoint, kvs.Get(KMSKesEndpoint))
+	if endpointStr != "" {
+		// Lookup kes configuration & overwrite config entry if ENV var is present
+		endpoint, err := xnet.ParseHTTPURL(endpointStr)
+		if err != nil {
+			return kesCfg, err
+		}
+		endpointStr = endpoint.String()
+	}
+
+	kesCfg.Endpoint = endpointStr
+	kesCfg.KeyFile = env.Get(EnvKMSKesKeyFile, kvs.Get(KMSKesKeyFile))
+	kesCfg.CertFile = env.Get(EnvKMSKesCertFile, kvs.Get(KMSKesCertFile))
+	kesCfg.CAPath = env.Get(EnvKMSKesCAPath, kvs.Get(KMSKesCAPath))
+	kesCfg.DefaultKeyID = env.Get(EnvKMSKesKeyName, kvs.Get(KMSKesKeyName))
+
+	if reflect.DeepEqual(kesCfg, defaultKesCfg) {
+		return kesCfg, nil
+	}
+
+	// Verify all the proper settings.
+	if err := kesCfg.Verify(); err != nil {
+		return kesCfg, err
+	}
+	kesCfg.Enabled = true
+	return kesCfg, nil
+}
+
+func lookupAutoEncryption() (bool, error) {
+	autoBool, err := config.ParseBool(env.Get(EnvAutoEncryptionLegacy, config.EnableOff))
+	if err != nil {
+		return false, err
+	}
+	if !autoBool {
+		autoBool, err = config.ParseBool(env.Get(EnvKMSAutoEncryption, config.EnableOff))
+		if err != nil {
+			return false, err
+		}
+	}
+	return autoBool, nil
+}
+
+// LookupConfig lookup vault or kes config, returns KMSConfig
+// to configure KMS object for object encryption
+func LookupConfig(c config.Config, defaultRootCAsDir string, transport *http.Transport) (KMSConfig, error) {
+	vcfg, err := LookupVaultConfig(c[config.KmsVaultSubSys][config.Default])
+	if err != nil {
+		return KMSConfig{}, err
+	}
+	kesCfg, err := LookupKesConfig(c[config.KmsKesSubSys][config.Default])
+	if err != nil {
+		return KMSConfig{}, err
+	}
+	kesCfg.Transport = transport
+	if kesCfg.Enabled && kesCfg.CAPath == "" {
+		kesCfg.CAPath = defaultRootCAsDir
+	}
+	autoEncrypt, err := lookupAutoEncryption()
+	if err != nil {
+		return KMSConfig{}, err
+	}
+	kmsCfg := KMSConfig{
+		AutoEncryption: autoEncrypt,
+		Vault:          vcfg,
+		Kes:            kesCfg,
+	}
+	return kmsCfg, nil
+}
+
+// LookupVaultConfig extracts the KMS configuration provided by environment
 // variables and merge them with the provided KMS configuration. The
 // merging follows the following rules:
 //
@@ -124,78 +297,101 @@ const (
 //
 // It sets the global KMS configuration according to the merged configuration
 // on succes.
-func LookupConfig(kvs config.KVS) (KMSConfig, error) {
-	if err := config.CheckValidKeys(config.KmsVaultSubSys, kvs, DefaultKVS); err != nil {
-		return KMSConfig{}, err
+func LookupVaultConfig(kvs config.KVS) (VaultConfig, error) {
+	if err := config.CheckValidKeys(config.KmsVaultSubSys, kvs, DefaultVaultKVS); err != nil {
+		return VaultConfig{}, err
 	}
-	kmsCfg, err := lookupConfigLegacy(kvs)
+
+	vcfg, err := lookupConfigLegacy(kvs)
 	if err != nil {
-		return kmsCfg, err
+		return vcfg, err
 	}
-	if !kmsCfg.AutoEncryption {
-		kmsCfg.AutoEncryption, err = config.ParseBool(env.Get(EnvKMSAutoEncryption, config.StateOff))
+
+	if vcfg.Enabled {
+		return vcfg, nil
+	}
+
+	vcfg = VaultConfig{
+		Auth: VaultAuth{
+			Type: "approle",
+		},
+	}
+
+	endpointStr := env.Get(EnvKMSVaultEndpoint, kvs.Get(KMSVaultEndpoint))
+	if endpointStr != "" {
+		// Lookup Hashicorp-Vault configuration & overwrite config entry if ENV var is present
+		endpoint, err := xnet.ParseHTTPURL(endpointStr)
 		if err != nil {
-			return kmsCfg, err
+			return vcfg, err
 		}
+		endpointStr = endpoint.String()
 	}
-	if !kmsCfg.Vault.IsEmpty() {
-		return kmsCfg, nil
-	}
-	stateBool, err := config.ParseBool(env.Get(EnvKMSVaultState, kvs.Get(config.State)))
-	if err != nil {
-		return kmsCfg, err
-	}
-	if !stateBool {
-		return kmsCfg, nil
-	}
-	vcfg := VaultConfig{}
-	// Lookup Hashicorp-Vault configuration & overwrite config entry if ENV var is present
-	vcfg.Endpoint = env.Get(EnvKMSVaultEndpoint, kvs.Get(KMSVaultEndpoint))
+
+	vcfg.Endpoint = endpointStr
 	vcfg.CAPath = env.Get(EnvKMSVaultCAPath, kvs.Get(KMSVaultCAPath))
 	vcfg.Auth.Type = env.Get(EnvKMSVaultAuthType, kvs.Get(KMSVaultAuthType))
+	if vcfg.Auth.Type == "" {
+		vcfg.Auth.Type = "approle"
+	}
+
 	vcfg.Auth.AppRole.ID = env.Get(EnvKMSVaultAppRoleID, kvs.Get(KMSVaultAppRoleID))
 	vcfg.Auth.AppRole.Secret = env.Get(EnvKMSVaultAppSecretID, kvs.Get(KMSVaultAppRoleSecret))
 	vcfg.Key.Name = env.Get(EnvKMSVaultKeyName, kvs.Get(KMSVaultKeyName))
 	vcfg.Namespace = env.Get(EnvKMSVaultNamespace, kvs.Get(KMSVaultNamespace))
-	keyVersion := env.Get(EnvKMSVaultKeyVersion, kvs.Get(KMSVaultKeyVersion))
-
-	if keyVersion != "" {
+	if keyVersion := env.Get(EnvKMSVaultKeyVersion, kvs.Get(KMSVaultKeyVersion)); keyVersion != "" {
 		vcfg.Key.Version, err = strconv.Atoi(keyVersion)
 		if err != nil {
-			return kmsCfg, fmt.Errorf("Unable to parse VaultKeyVersion value (`%s`)", keyVersion)
+			return vcfg, Errorf("Unable to parse VaultKeyVersion value (`%s`)", keyVersion)
 		}
 	}
 
-	if err = vcfg.Verify(); err != nil {
-		return kmsCfg, err
+	if reflect.DeepEqual(vcfg, defaultVaultCfg) {
+		return vcfg, nil
 	}
 
-	kmsCfg.Vault = vcfg
-	return kmsCfg, nil
+	// Verify all the proper settings.
+	if err = vcfg.Verify(); err != nil {
+		return vcfg, err
+	}
+
+	vcfg.Enabled = true
+	return vcfg, nil
 }
 
 // NewKMS - initialize a new KMS.
 func NewKMS(cfg KMSConfig) (kms KMS, err error) {
-	// Lookup KMS master keys - only available through ENV.
-	if masterKeyLegacy, ok := env.Lookup(EnvKMSMasterKeyLegacy); ok {
-		if !cfg.Vault.IsEmpty() { // Vault and KMS master key provided
+	// Lookup KMS master kes - only available through ENV.
+	if masterKeyLegacy := env.Get(EnvKMSMasterKeyLegacy, ""); len(masterKeyLegacy) != 0 {
+		if cfg.Vault.Enabled { // Vault and KMS master key provided
 			return kms, errors.New("Ambiguous KMS configuration: vault configuration and a master key are provided at the same time")
+		}
+		if cfg.Kes.Enabled {
+			return kms, errors.New("Ambiguous KMS configuration: kes configuration and a master key are provided at the same time")
 		}
 		kms, err = ParseMasterKey(masterKeyLegacy)
 		if err != nil {
 			return kms, err
 		}
-	} else if masterKey, ok := env.Lookup(EnvKMSMasterKey); ok {
-		if !cfg.Vault.IsEmpty() { // Vault and KMS master key provided
+	} else if masterKey := env.Get(EnvKMSMasterKey, ""); len(masterKey) != 0 {
+		if cfg.Vault.Enabled { // Vault and KMS master key provided
 			return kms, errors.New("Ambiguous KMS configuration: vault configuration and a master key are provided at the same time")
+		}
+		if cfg.Kes.Enabled {
+			return kms, errors.New("Ambiguous KMS configuration: kes configuration and a master key are provided at the same time")
 		}
 		kms, err = ParseMasterKey(masterKey)
 		if err != nil {
 			return kms, err
 		}
-	}
-	if !cfg.Vault.IsEmpty() {
+	} else if cfg.Vault.Enabled && cfg.Kes.Enabled {
+		return kms, errors.New("Ambiguous KMS configuration: vault configuration and kes configuration are provided at the same time")
+	} else if cfg.Vault.Enabled {
 		kms, err = NewVault(cfg.Vault)
+		if err != nil {
+			return kms, err
+		}
+	} else if cfg.Kes.Enabled {
+		kms, err = NewKes(cfg.Kes)
 		if err != nil {
 			return kms, err
 		}

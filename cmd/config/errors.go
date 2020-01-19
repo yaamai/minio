@@ -45,13 +45,13 @@ var (
 	ErrInvalidCacheDrivesValue = newErrFn(
 		"Invalid cache drive value",
 		"Please check the value in this ENV variable",
-		"MINIO_CACHE_DRIVES: Mounted drives or directories are delimited by `;`",
+		"MINIO_CACHE_DRIVES: Mounted drives or directories are delimited by `,`",
 	)
 
 	ErrInvalidCacheExcludesValue = newErrFn(
 		"Invalid cache excludes value",
 		"Please check the passed value",
-		"MINIO_CACHE_EXCLUDE: Cache exclusion patterns are delimited by `;`",
+		"MINIO_CACHE_EXCLUDE: Cache exclusion patterns are delimited by `,`",
 	)
 
 	ErrInvalidCacheExpiryValue = newErrFn(
@@ -72,11 +72,28 @@ var (
 		"MINIO_CACHE_ENCRYPTION_MASTER_KEY: For more information, please refer to https://docs.min.io/docs/minio-disk-cache-guide",
 	)
 
+	ErrInvalidRotatingCredentialsBackendEncrypted = newErrFn(
+		"Invalid rotating credentials",
+		"Please set correct rotating credentials in the environment for decryption",
+		`Detected encrypted config backend, correct old access and secret keys should be specified via environment variables MINIO_ACCESS_KEY_OLD and MINIO_SECRET_KEY_OLD to be able to re-encrypt the MinIO config, user IAM and policies with new credentials`,
+	)
+
+	ErrInvalidCredentialsBackendEncrypted = newErrFn(
+		"Invalid credentials",
+		"Please set correct credentials in the environment for decryption",
+		`Detected encrypted config backend, correct access and secret keys should be specified via environment variables MINIO_ACCESS_KEY and MINIO_SECRET_KEY to be able to decrypt the MinIO config, user IAM and policies`,
+	)
+
+	ErrMissingCredentialsBackendEncrypted = newErrFn(
+		"Credentials missing",
+		"Please set your credentials in the environment",
+		`Detected encrypted config backend, access and secret keys should be specified via environment variables MINIO_ACCESS_KEY and MINIO_SECRET_KEY to be able to decrypt the MinIO config, user IAM and policies`,
+	)
+
 	ErrInvalidCredentials = newErrFn(
 		"Invalid credentials",
 		"Please provide correct credentials",
-		`Access key length should be between minimum 3 characters in length.
-Secret key should be in between 8 and 40 characters`,
+		`Access key length should be at least 3, and secret key length at least 8 characters`,
 	)
 
 	ErrEnvCredentialsMissingGateway = newErrFn(

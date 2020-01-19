@@ -27,7 +27,6 @@ import (
 	"net/url"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/minio/minio/pkg/auth"
@@ -48,6 +47,10 @@ func prepareAdminXLTestBed() (*adminXLTestBed, error) {
 	// reset global variables to start afresh.
 	resetTestGlobals()
 
+	// Set globalIsXL to indicate that the setup uses an erasure
+	// code backend.
+	globalIsXL = true
+
 	// Initializing objectLayer for HealFormatHandler.
 	objLayer, xlDirs, xlErr := initTestXLObjLayer()
 	if xlErr != nil {
@@ -62,20 +65,7 @@ func prepareAdminXLTestBed() (*adminXLTestBed, error) {
 	// Initialize boot time
 	globalBootTime = UTCNow()
 
-	globalEndpoints = mustGetNewEndpointList(xlDirs...)
-
-	// Set globalIsXL to indicate that the setup uses an erasure
-	// code backend.
-	globalIsXL = true
-
-	// initialize NSLock.
-	isDistXL := false
-	initNSLock(isDistXL)
-
-	// Init global heal state
-	if globalIsXL {
-		globalAllHealState = initHealState()
-	}
+	globalEndpoints = mustGetZoneEndpoints(xlDirs...)
 
 	globalConfigSys = NewConfigSys()
 
@@ -90,7 +80,7 @@ func prepareAdminXLTestBed() (*adminXLTestBed, error) {
 	globalPolicySys = NewPolicySys()
 	globalPolicySys.Init(buckets, objLayer)
 
-	globalNotificationSys = NewNotificationSys(globalServerConfig, globalEndpoints)
+	globalNotificationSys = NewNotificationSys(globalEndpoints)
 	globalNotificationSys.Init(buckets, objLayer)
 
 	// Setup admin mgmt REST API handlers.
@@ -118,8 +108,8 @@ func initTestXLObjLayer() (ObjectLayer, []string, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	endpoints := mustGetNewEndpointList(xlDirs...)
-	format, err := waitForFormatXL(true, endpoints, 1, 16)
+	endpoints := mustGetNewEndpoints(xlDirs...)
+	format, err := waitForFormatXL(true, endpoints, 1, 1, 16, "")
 	if err != nil {
 		removeRoots(xlDirs)
 		return nil, nil, err
@@ -184,7 +174,7 @@ func testServiceSignalReceiver(cmd cmdType, t *testing.T) {
 func getServiceCmdRequest(cmd cmdType, cred auth.Credentials) (*http.Request, error) {
 	queryVal := url.Values{}
 	queryVal.Set("action", string(cmd.toServiceAction()))
-	resource := adminAPIPathPrefix + "/service?" + queryVal.Encode()
+	resource := adminPathPrefix + adminAPIVersionPrefix + "/service?" + queryVal.Encode()
 	req, err := newTestRequest(http.MethodPost, resource, 0, nil)
 	if err != nil {
 		return nil, err
@@ -253,7 +243,7 @@ func buildAdminRequest(queryVal url.Values, method, path string,
 	contentLength int64, bodySeeker io.ReadSeeker) (*http.Request, error) {
 
 	req, err := newTestRequest(method,
-		adminAPIPathPrefix+path+"?"+queryVal.Encode(),
+		adminPathPrefix+adminAPIVersionPrefix+path+"?"+queryVal.Encode(),
 		contentLength, bodySeeker)
 	if err != nil {
 		return nil, err
@@ -293,23 +283,14 @@ func TestAdminServerInfo(t *testing.T) {
 		t.Errorf("Expected to succeed but failed with %d", rec.Code)
 	}
 
-	results := []ServerInfo{}
+	results := madmin.InfoMessage{}
 	err = json.NewDecoder(rec.Body).Decode(&results)
 	if err != nil {
 		t.Fatalf("Failed to decode set config result json %v", err)
 	}
 
-	if len(results) == 0 {
-		t.Error("Expected at least one server info result")
-	}
-
-	for _, serverInfo := range results {
-		if serverInfo.Error != "" {
-			t.Errorf("Unexpected error = %v\n", serverInfo.Error)
-		}
-		if serverInfo.Data.Properties.Region != globalMinioDefaultRegion {
-			t.Errorf("Expected %s, got %s", globalMinioDefaultRegion, serverInfo.Data.Properties.Region)
-		}
+	if results.Region != globalMinioDefaultRegion {
+		t.Errorf("Expected %s, got %s", globalMinioDefaultRegion, results.Region)
 	}
 }
 
@@ -342,46 +323,6 @@ func TestToAdminAPIErrCode(t *testing.T) {
 			t.Errorf("Test %d: Expected %v but received %v",
 				i+1, test.expectedAPIErr, actualErr)
 		}
-	}
-}
-
-func TestTopLockEntries(t *testing.T) {
-	t1 := UTCNow()
-	t2 := UTCNow().Add(10 * time.Second)
-	peerLocks := []*PeerLocks{
-		{
-			Addr: "1",
-			Locks: map[string][]lockRequesterInfo{
-				"1": {
-					{false, "node2", "ep2", "2", t2, t2, ""},
-					{true, "node1", "ep1", "1", t1, t1, ""},
-				},
-				"2": {
-					{false, "node2", "ep2", "2", t2, t2, ""},
-					{true, "node1", "ep1", "1", t1, t1, ""},
-				},
-			},
-		},
-		{
-			Addr: "2",
-			Locks: map[string][]lockRequesterInfo{
-				"1": {
-					{false, "node2", "ep2", "2", t2, t2, ""},
-					{true, "node1", "ep1", "1", t1, t1, ""},
-				},
-				"2": {
-					{false, "node2", "ep2", "2", t2, t2, ""},
-					{true, "node1", "ep1", "1", t1, t1, ""},
-				},
-			},
-		},
-	}
-	les := topLockEntries(peerLocks)
-	if len(les) != 2 {
-		t.Fatalf("Did not get 2 results")
-	}
-	if les[0].Timestamp.After(les[1].Timestamp) {
-		t.Fatalf("Got wrong sorted value")
 	}
 }
 

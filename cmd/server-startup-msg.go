@@ -31,12 +31,13 @@ import (
 
 // Documentation links, these are part of message printing code.
 const (
-	mcQuickStartGuide     = "https://docs.min.io/docs/minio-client-quickstart-guide"
-	goQuickStartGuide     = "https://docs.min.io/docs/golang-client-quickstart-guide"
-	jsQuickStartGuide     = "https://docs.min.io/docs/javascript-client-quickstart-guide"
-	javaQuickStartGuide   = "https://docs.min.io/docs/java-client-quickstart-guide"
-	pyQuickStartGuide     = "https://docs.min.io/docs/python-client-quickstart-guide"
-	dotnetQuickStartGuide = "https://docs.min.io/docs/dotnet-client-quickstart-guide"
+	mcQuickStartGuide      = "https://docs.min.io/docs/minio-client-quickstart-guide"
+	mcAdminQuickStartGuide = "https://docs.min.io/docs/minio-admin-complete-guide.html"
+	goQuickStartGuide      = "https://docs.min.io/docs/golang-client-quickstart-guide"
+	jsQuickStartGuide      = "https://docs.min.io/docs/javascript-client-quickstart-guide"
+	javaQuickStartGuide    = "https://docs.min.io/docs/java-client-quickstart-guide"
+	pyQuickStartGuide      = "https://docs.min.io/docs/python-client-quickstart-guide"
+	dotnetQuickStartGuide  = "https://docs.min.io/docs/dotnet-client-quickstart-guide"
 )
 
 // generates format string depending on the string length and padding.
@@ -45,15 +46,73 @@ func getFormatStr(strLen int, padding int) string {
 	return "%" + formatStr
 }
 
-// Prints the formatted startup message.
-func printStartupMessage(apiEndPoints []string) {
+func printStartupSafeModeMessage(apiEndpoints []string, err error) {
+	logStartupMessage(color.RedBold("Server startup failed with '%v'", err))
+	logStartupMessage(color.RedBold("Server switching to safe mode"))
+	logStartupMessage(color.RedBold("Please use 'mc admin config' commands fix this issue"))
 
-	strippedAPIEndpoints := stripStandardPorts(apiEndPoints)
-	// If cache layer is enabled, print cache capacity.
-	cacheObjectAPI := newCacheObjectsFn()
-	if cacheObjectAPI != nil {
-		printCacheStorageInfo(cacheObjectAPI.StorageInfo(context.Background()))
+	// Object layer is initialized then print StorageInfo in safe mode.
+	objAPI := newObjectLayerWithoutSafeModeFn()
+	if objAPI != nil {
+		if msg := getStorageInfoMsgSafeMode(objAPI.StorageInfo(context.Background())); msg != "" {
+			logStartupMessage(msg)
+		}
 	}
+
+	// Get saved credentials.
+	cred := globalActiveCred
+
+	// Get saved region.
+	region := globalServerRegion
+
+	strippedAPIEndpoints := stripStandardPorts(apiEndpoints)
+
+	apiEndpointStr := strings.Join(strippedAPIEndpoints, "  ")
+
+	// Colorize the message and print.
+	logStartupMessage(color.Red("Endpoint: ") + color.Bold(fmt.Sprintf(getFormatStr(len(apiEndpointStr), 1), apiEndpointStr)))
+	if color.IsTerminal() && !globalCLIContext.Anonymous {
+		logStartupMessage(color.Red("AccessKey: ") + color.Bold(fmt.Sprintf("%s ", cred.AccessKey)))
+		logStartupMessage(color.Red("SecretKey: ") + color.Bold(fmt.Sprintf("%s ", cred.SecretKey)))
+		if region != "" {
+			logStartupMessage(color.Red("Region: ") + color.Bold(fmt.Sprintf(getFormatStr(len(region), 3), region)))
+		}
+	}
+
+	// Prints `mc` cli configuration message chooses
+	// first endpoint as default.
+	alias := "myminio"
+	endPoint := strippedAPIEndpoints[0]
+
+	// Configure 'mc', following block prints platform specific information for minio client admin commands.
+	if color.IsTerminal() && !globalCLIContext.Anonymous {
+		logStartupMessage(color.RedBold("\nCommand-line Access: ") + mcAdminQuickStartGuide)
+		if runtime.GOOS == globalWindowsOSName {
+			mcMessage := fmt.Sprintf("> mc.exe config host add %s %s %s %s --api s3v4", alias,
+				endPoint, cred.AccessKey, cred.SecretKey)
+			logStartupMessage(fmt.Sprintf(getFormatStr(len(mcMessage), 3), mcMessage))
+			mcMessage = fmt.Sprintf("> mc.exe admin config --help")
+			logStartupMessage(fmt.Sprintf(getFormatStr(len(mcMessage), 3), mcMessage))
+		} else {
+			mcMessage := fmt.Sprintf("$ mc config host add %s %s %s %s --api s3v4", alias,
+				endPoint, cred.AccessKey, cred.SecretKey)
+			logStartupMessage(fmt.Sprintf(getFormatStr(len(mcMessage), 3), mcMessage))
+			mcMessage = fmt.Sprintf("$ mc admin config --help")
+			logStartupMessage(fmt.Sprintf(getFormatStr(len(mcMessage), 3), mcMessage))
+		}
+	}
+}
+
+// Prints the formatted startup message.
+func printStartupMessage(apiEndpoints []string) {
+
+	strippedAPIEndpoints := stripStandardPorts(apiEndpoints)
+	// If cache layer is enabled, print cache capacity.
+	cachedObjAPI := newCachedObjectLayerFn()
+	if cachedObjAPI != nil {
+		printCacheStorageInfo(cachedObjAPI.StorageInfo(context.Background()))
+	}
+
 	// Object layer is initialized then print StorageInfo.
 	objAPI := newObjectLayerFn()
 	if objAPI != nil {
@@ -97,9 +156,8 @@ func stripStandardPorts(apiEndpoints []string) (newAPIEndpoints []string) {
 	newAPIEndpoints = make([]string, len(apiEndpoints))
 	// Check all API endpoints for standard ports and strip them.
 	for i, apiEndpoint := range apiEndpoints {
-		u, err := xnet.ParseURL(apiEndpoint)
+		u, err := xnet.ParseHTTPURL(apiEndpoint)
 		if err != nil {
-			newAPIEndpoints[i] = apiEndpoint
 			continue
 		}
 		if globalMinioHost == "" && isNotIPv4(u.Host) {
@@ -140,6 +198,10 @@ func printServerCommonMsg(apiEndpoints []string) {
 
 // Prints bucket notification configurations.
 func printEventNotifiers() {
+	if globalNotificationSys == nil {
+		return
+	}
+
 	arns := globalNotificationSys.GetARNList()
 	if len(arns) == 0 {
 		return
@@ -160,7 +222,7 @@ func printCLIAccessMsg(endPoint string, alias string) {
 	cred := globalActiveCred
 
 	// Configure 'mc', following block prints platform specific information for minio client.
-	if color.IsTerminal() {
+	if color.IsTerminal() && !globalCLIContext.Anonymous {
 		logStartupMessage(color.Blue("\nCommand-line Access: ") + mcQuickStartGuide)
 		if runtime.GOOS == globalWindowsOSName {
 			mcMessage := fmt.Sprintf("$ mc.exe config host add %s %s %s %s", alias,
@@ -182,6 +244,16 @@ func printObjectAPIMsg() {
 	logStartupMessage(color.Blue("   Python: ") + fmt.Sprintf(getFormatStr(len(pyQuickStartGuide), 4), pyQuickStartGuide))
 	logStartupMessage(color.Blue("   JavaScript: ") + jsQuickStartGuide)
 	logStartupMessage(color.Blue("   .NET: ") + fmt.Sprintf(getFormatStr(len(dotnetQuickStartGuide), 6), dotnetQuickStartGuide))
+}
+
+// Get formatted disk/storage info message.
+func getStorageInfoMsgSafeMode(storageInfo StorageInfo) string {
+	var msg string
+	if storageInfo.Backend.Type == BackendErasure {
+		diskInfo := fmt.Sprintf(" %d Online, %d Offline. ", storageInfo.Backend.OnlineDisks.Sum(), storageInfo.Backend.OfflineDisks.Sum())
+		msg += color.Red("Status:") + fmt.Sprintf(getFormatStr(len(diskInfo), 8), diskInfo)
+	}
+	return msg
 }
 
 // Get formatted disk/storage info message.

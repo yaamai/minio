@@ -17,6 +17,7 @@
 package dns
 
 import (
+	"encoding/json"
 	"time"
 )
 
@@ -28,13 +29,13 @@ const (
 
 // SrvRecord - represents a DNS service record
 type SrvRecord struct {
-	Host     string `json:"host,omitempty"`
-	Port     string `json:"port,omitempty"`
-	Priority int    `json:"priority,omitempty"`
-	Weight   int    `json:"weight,omitempty"`
-	Text     string `json:"text,omitempty"`
-	Mail     bool   `json:"mail,omitempty"` // Be an MX record. Priority becomes Preference.
-	TTL      uint32 `json:"ttl,omitempty"`
+	Host     string      `json:"host,omitempty"`
+	Port     json.Number `json:"port,omitempty"`
+	Priority int         `json:"priority,omitempty"`
+	Weight   int         `json:"weight,omitempty"`
+	Text     string      `json:"text,omitempty"`
+	Mail     bool        `json:"mail,omitempty"` // Be an MX record. Priority becomes Preference.
+	TTL      uint32      `json:"ttl,omitempty"`
 
 	// Holds info about when the entry was created first.
 	CreationDate time.Time `json:"creationDate"`
@@ -53,14 +54,4 @@ type SrvRecord struct {
 
 	// Key carries the original key used during Put().
 	Key string `json:"-"`
-}
-
-// Config - represents dns put, get interface. This interface can be
-// used to implement various backends as needed.
-type Config interface {
-	Put(key string) error
-	List() ([]SrvRecord, error)
-	Get(key string) ([]SrvRecord, error)
-	Delete(key string) error
-	DeleteRecord(record SrvRecord) error
 }

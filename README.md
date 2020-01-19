@@ -3,9 +3,7 @@
 
 [![MinIO](https://raw.githubusercontent.com/minio/minio/master/.github/logo.svg?sanitize=true)](https://min.io)
 
-MinIO is an object storage server released under Apache License v2.0. It is compatible with Amazon S3 cloud storage service. It is best suited for storing unstructured data such as photos, videos, log files, backups and container / VM images. Size of an object can range from a few KBs to a maximum of 5TB.
-
-MinIO server is light enough to be bundled with the application stack, similar to NodeJS, Redis and MySQL.
+MinIO is High Performance Object Storage released under Apache License v2.0. It is API compatible with Amazon S3 cloud storage service. Using MinIO build high performance infrastructure for machine learning, analytics and application data workloads.
 
 ## Docker Container
 ### Stable
@@ -19,7 +17,8 @@ docker run -p 9000:9000 minio/minio server /data
 docker pull minio/minio:edge
 docker run -p 9000:9000 minio/minio:edge server /data
 ```
-Note: Docker will not display the default keys unless you start the container with the `-it`(interactive TTY) argument. Generally, it is not recommended to use default keys with containers. Please visit MinIO Docker quickstart guide for more information [here](https://docs.min.io/docs/minio-docker-quickstart-guide)
+
+> NOTE: Docker will not display the default keys unless you start the container with the `-it`(interactive TTY) argument. Generally, it is not recommended to use default keys with containers. Please visit MinIO Docker quickstart guide for more information [here](https://docs.min.io/docs/minio-docker-quickstart-guide)
 
 ## macOS
 ### Homebrew
@@ -36,8 +35,8 @@ brew install minio/stable/minio
 ```
 
 ### Binary Download
-| Platform    | Architecture | URL                                                         |
-| ----------  | --------     | ------                                                      |
+| Platform    | Architecture | URL                                                       |
+| ----------  | --------     | ------                                                    |
 | Apple macOS | 64-bit Intel | https://dl.min.io/server/minio/release/darwin-amd64/minio |
 ```sh
 chmod 755 minio
@@ -46,8 +45,8 @@ chmod 755 minio
 
 ## GNU/Linux
 ### Binary Download
-| Platform   | Architecture | URL                                                        |
-| ---------- | --------     | ------                                                     |
+| Platform   | Architecture | URL                                                      |
+| ---------- | --------     | ------                                                   |
 | GNU/Linux  | 64-bit Intel | https://dl.min.io/server/minio/release/linux-amd64/minio |
 ```sh
 wget https://dl.min.io/server/minio/release/linux-amd64/minio
@@ -55,8 +54,8 @@ chmod +x minio
 ./minio server /data
 ```
 
-| Platform   | Architecture | URL                                                          |
-| ---------- | --------     | ------                                                       |
+| Platform   | Architecture | URL                                                        |
+| ---------- | --------     | ------                                                     |
 | GNU/Linux  | ppc64le      | https://dl.min.io/server/minio/release/linux-ppc64le/minio |
 ```sh
 wget https://dl.min.io/server/minio/release/linux-ppc64le/minio
@@ -66,8 +65,8 @@ chmod +x minio
 
 ## Microsoft Windows
 ### Binary Download
-| Platform          | Architecture | URL                                                              |
-| ----------        | --------     | ------                                                           |
+| Platform          | Architecture | URL                                                            |
+| ----------        | --------     | ------                                                         |
 | Microsoft Windows | 64-bit       | https://dl.min.io/server/minio/release/windows-amd64/minio.exe |
 ```sh
 minio.exe server D:\Photos
@@ -85,7 +84,7 @@ service minio start
 ```
 
 ## Install from Source
-Source installation is only intended for developers and advanced users. If you do not have a working Golang environment, please follow [How to install Golang](https://golang.org/doc/install). Minimum version required is [go1.12](https://golang.org/dl/#stable)
+Source installation is only intended for developers and advanced users. If you do not have a working Golang environment, please follow [How to install Golang](https://golang.org/doc/install). Minimum version required is [go1.13](https://golang.org/dl/#stable)
 
 ```sh
 GO111MODULE=on go get github.com/minio/minio

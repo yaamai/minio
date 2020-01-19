@@ -39,8 +39,6 @@ const (
 	ClassStandard = "standard"
 	ClassRRS      = "rrs"
 
-	// Env to on/off storage class settings.
-	EnvStorageClass = "MINIO_STORAGE_CLASS_STATE"
 	// Reduced redundancy storage class environment variable
 	RRSEnv = "MINIO_STORAGE_CLASS_RRS"
 	// Standard storage class environment variable
@@ -59,10 +57,14 @@ const (
 // DefaultKVS - default storage class config
 var (
 	DefaultKVS = config.KVS{
-		config.State:   config.StateOff,
-		config.Comment: "This is a default StorageClass configuration, only applicable in erasure coded setups",
-		ClassStandard:  "",
-		ClassRRS:       "EC:2",
+		config.KV{
+			Key:   ClassStandard,
+			Value: "",
+		},
+		config.KV{
+			Key:   ClassRRS,
+			Value: "EC:2",
+		},
 	}
 )
 
@@ -210,6 +212,13 @@ func (sCfg Config) GetParityForSC(sc string) (parity int) {
 	}
 }
 
+// Enabled returns if etcd is enabled.
+func Enabled(kvs config.KVS) bool {
+	ssc := kvs.Get(ClassStandard)
+	rrsc := kvs.Get(ClassRRS)
+	return ssc != "" || rrsc != ""
+}
+
 // LookupConfig - lookup storage class config and override with valid environment settings if any.
 func LookupConfig(kvs config.KVS, drivesPerSet int) (cfg Config, err error) {
 	cfg = Config{}
@@ -220,21 +229,10 @@ func LookupConfig(kvs config.KVS, drivesPerSet int) (cfg Config, err error) {
 		return cfg, err
 	}
 
-	stateBool, err := config.ParseBool(env.Get(EnvStorageClass, kvs.Get(config.State)))
-	if err != nil {
-		return cfg, err
-	}
-	if stateBool {
-		if ssc := env.Get(StandardEnv, kvs.Get(ClassStandard)); ssc == "" {
-			return cfg, config.Error("'standard' key cannot be empty if you wish to enable storage class")
-		}
-		if rrsc := env.Get(RRSEnv, kvs.Get(ClassRRS)); rrsc == "" {
-			return cfg, config.Error("'rrs' key cannot be empty if you wish to enable storage class")
-		}
-	}
-
+	ssc := env.Get(StandardEnv, kvs.Get(ClassStandard))
+	rrsc := env.Get(RRSEnv, kvs.Get(ClassRRS))
 	// Check for environment variables and parse into storageClass struct
-	if ssc := env.Get(StandardEnv, kvs.Get(ClassStandard)); ssc != "" {
+	if ssc != "" {
 		cfg.Standard, err = parseStorageClass(ssc)
 		if err != nil {
 			return cfg, err
@@ -244,7 +242,7 @@ func LookupConfig(kvs config.KVS, drivesPerSet int) (cfg Config, err error) {
 		cfg.Standard.Parity = drivesPerSet / 2
 	}
 
-	if rrsc := env.Get(RRSEnv, kvs.Get(ClassRRS)); rrsc != "" {
+	if rrsc != "" {
 		cfg.RRS, err = parseStorageClass(rrsc)
 		if err != nil {
 			return cfg, err

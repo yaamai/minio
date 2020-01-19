@@ -41,10 +41,14 @@ const (
 // DefaultKVS - default config for OPA config
 var (
 	DefaultKVS = config.KVS{
-		config.State:   config.StateOff,
-		config.Comment: "This is a default OPA configuration",
-		URL:            "",
-		AuthToken:      "",
+		config.KV{
+			Key:   URL,
+			Value: "",
+		},
+		config.KV{
+			Key:   AuthToken,
+			Value: "",
+		},
 	}
 )
 
@@ -104,6 +108,11 @@ type Opa struct {
 	client *http.Client
 }
 
+// Enabled returns if opa is enabled.
+func Enabled(kvs config.KVS) bool {
+	return kvs.Get(URL) != ""
+}
+
 // LookupConfig lookup Opa from config, override with any ENVs.
 func LookupConfig(kv config.KVS, transport *http.Transport, closeRespFn func(io.ReadCloser)) (Args, error) {
 	args := Args{}
@@ -124,7 +133,7 @@ func LookupConfig(kv config.KVS, transport *http.Transport, closeRespFn func(io.
 		authToken = env.Get(EnvPolicyOpaAuthToken, kv.Get(AuthToken))
 	}
 
-	u, err := xnet.ParseURL(opaURL)
+	u, err := xnet.ParseHTTPURL(opaURL)
 	if err != nil {
 		return args, err
 	}

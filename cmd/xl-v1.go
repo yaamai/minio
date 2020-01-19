@@ -20,9 +20,11 @@ import (
 	"context"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/bpool"
+	"github.com/minio/minio/pkg/dsync"
 	"github.com/minio/minio/pkg/madmin"
 	xnet "github.com/minio/minio/pkg/net"
 	"github.com/minio/minio/pkg/sync/errgroup"
@@ -37,28 +39,44 @@ const (
 // OfflineDisk represents an unavailable disk.
 var OfflineDisk StorageAPI // zero value is nil
 
+// partialUpload is a successful upload of an object
+// but not written in all disks (having quorum)
+type partialUpload struct {
+	bucket    string
+	object    string
+	failedSet int
+}
+
 // xlObjects - Implements XL object layer.
 type xlObjects struct {
-	// name space mutex for object layer.
-	nsMutex *nsLockMap
-
 	// getDisks returns list of storageAPIs.
 	getDisks func() []StorageAPI
+
+	// getLockers returns list of remote and local lockers.
+	getLockers func() []dsync.NetLocker
+
+	// Locker mutex map.
+	nsMutex *nsLockMap
 
 	// Byte pools used for temporary i/o buffers.
 	bp *bpool.BytePoolCap
 
-	// TODO: Deprecated only kept here for tests, should be removed in future.
-	storageDisks []StorageAPI
-
 	// TODO: ListObjects pool management, should be removed in future.
 	listPool *TreeWalkPool
+
+	mrfUploadCh chan partialUpload
+}
+
+// NewNSLock - initialize a new namespace RWLocker instance.
+func (xl xlObjects) NewNSLock(ctx context.Context, bucket string, object string) RWLocker {
+	return xl.nsMutex.NewNSLock(ctx, xl.getLockers, bucket, object)
 }
 
 // Shutdown function for object storage interface.
 func (xl xlObjects) Shutdown(ctx context.Context) error {
 	// Add any object layer shutdown activities here.
 	closeStorageDisks(xl.getDisks())
+	closeLockers(xl.getLockers())
 	return nil
 }
 
@@ -99,6 +117,10 @@ func getDisksInfo(disks []StorageAPI) (disksInfo []DiskInfo, onlineDisks, offlin
 
 	getPeerAddress := func(diskPath string) (string, error) {
 		hostPort := strings.Split(diskPath, SlashSeparator)[0]
+		// Host will be empty for xl/fs disk paths.
+		if hostPort == "" {
+			return "", nil
+		}
 		thisAddr, err := xnet.ParseHost(hostPort)
 		if err != nil {
 			return "", err
@@ -122,6 +144,7 @@ func getDisksInfo(disks []StorageAPI) (disksInfo []DiskInfo, onlineDisks, offlin
 		}
 		if err != nil {
 			offlineDisks[peerAddr]++
+			continue
 		}
 		onlineDisks[peerAddr]++
 	}
@@ -130,39 +153,20 @@ func getDisksInfo(disks []StorageAPI) (disksInfo []DiskInfo, onlineDisks, offlin
 	return disksInfo, onlineDisks, offlineDisks
 }
 
-// returns sorted disksInfo slice which has only valid entries.
-// i.e the entries where the total size of the disk is not stated
-// as 0Bytes, this means that the disk is not online or ignored.
-func sortValidDisksInfo(disksInfo []DiskInfo) []DiskInfo {
-	var validDisksInfo []DiskInfo
-	for _, diskInfo := range disksInfo {
-		if diskInfo.Total == 0 {
-			continue
-		}
-		validDisksInfo = append(validDisksInfo, diskInfo)
-	}
-	sort.Sort(byDiskTotal(validDisksInfo))
-	return validDisksInfo
-}
-
 // Get an aggregated storage info across all disks.
 func getStorageInfo(disks []StorageAPI) StorageInfo {
 	disksInfo, onlineDisks, offlineDisks := getDisksInfo(disks)
 
 	// Sort so that the first element is the smallest.
-	validDisksInfo := sortValidDisksInfo(disksInfo)
-	// If there are no valid disks, set total and free disks to 0
-	if len(validDisksInfo) == 0 {
-		return StorageInfo{}
-	}
+	sort.Sort(byDiskTotal(disksInfo))
 
 	// Combine all disks to get total usage
-	usedList := make([]uint64, len(validDisksInfo))
-	totalList := make([]uint64, len(validDisksInfo))
-	availableList := make([]uint64, len(validDisksInfo))
-	mountPaths := make([]string, len(validDisksInfo))
+	usedList := make([]uint64, len(disksInfo))
+	totalList := make([]uint64, len(disksInfo))
+	availableList := make([]uint64, len(disksInfo))
+	mountPaths := make([]string, len(disksInfo))
 
-	for i, di := range validDisksInfo {
+	for i, di := range disksInfo {
 		usedList[i] = di.Used
 		totalList[i] = di.Total
 		availableList[i] = di.Free
@@ -186,4 +190,56 @@ func getStorageInfo(disks []StorageAPI) StorageInfo {
 // StorageInfo - returns underlying storage statistics.
 func (xl xlObjects) StorageInfo(ctx context.Context) StorageInfo {
 	return getStorageInfo(xl.getDisks())
+}
+
+// GetMetrics - no op
+func (xl xlObjects) GetMetrics(ctx context.Context) (*Metrics, error) {
+	logger.LogIf(ctx, NotImplemented{})
+	return &Metrics{}, NotImplemented{}
+}
+
+// crawlAndGetDataUsage picks three random disks to crawl and get data usage
+func (xl xlObjects) crawlAndGetDataUsage(ctx context.Context, endCh <-chan struct{}) DataUsageInfo {
+
+	var randomDisks []StorageAPI
+	for _, d := range xl.getLoadBalancedDisks() {
+		if d == nil || !d.IsOnline() {
+			continue
+		}
+		randomDisks = append(randomDisks, d)
+		if len(randomDisks) >= 3 {
+			break
+		}
+	}
+
+	var dataUsageResults = make([]DataUsageInfo, len(randomDisks))
+
+	var wg sync.WaitGroup
+	for i := 0; i < len(randomDisks); i++ {
+		wg.Add(1)
+		go func(index int, disk StorageAPI) {
+			defer wg.Done()
+			var err error
+			dataUsageResults[index], err = disk.CrawlAndGetDataUsage(endCh)
+			if err != nil {
+				logger.LogIf(ctx, err)
+			}
+		}(i, randomDisks[i])
+	}
+	wg.Wait()
+
+	var dataUsageInfo DataUsageInfo
+	for i := 0; i < len(dataUsageResults); i++ {
+		if dataUsageResults[i].ObjectsCount > dataUsageInfo.ObjectsCount {
+			dataUsageInfo = dataUsageResults[i]
+		}
+	}
+
+	return dataUsageInfo
+}
+
+// IsReady - No Op.
+func (xl xlObjects) IsReady(ctx context.Context) bool {
+	logger.CriticalIf(ctx, NotImplemented{})
+	return true
 }
