@@ -19,7 +19,9 @@ def pipeline(arch):
         "name": "build",
         "image": "golang",
         "commands": [
-          "make build"
+          "make build",
+          "mkdir -p release/" + arch,
+          "mv minio release/" + arch
         ]
       },
       {
@@ -29,7 +31,10 @@ def pipeline(arch):
           "api_key": {
             "from_secret": "github_apikey"
           },
-          "files": "minio"
+          "files": "release/*"
+        },
+        "when": {
+          "event": "tag"
         }
       },
       {
