@@ -16,6 +16,23 @@ def pipeline(arch):
     },
     "steps": [
       {
+        "name": "build",
+        "image": "golang",
+        "commands": [
+          "make build"
+        ]
+      },
+      {
+        "name": "github-release",
+        "image": "plugins/github-release",
+        "settings": {
+          "api_key": {
+            "from_secret": "github_apikey"
+          },
+          "files": "minio"
+        }
+      },
+      {
         "name": "image-build",
         "image": "plugins/docker",
         "settings": {
