@@ -21,7 +21,10 @@ def pipeline(arch):
         "commands": [
           "make build",
           "mv minio minio-" + arch
-        ]
+        ],
+        "when": {
+          "event": "tag"
+        }
       },
       {
         "name": "github-release",
